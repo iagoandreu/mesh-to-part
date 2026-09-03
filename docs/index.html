@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh to Part — Fusion 360 add-in</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --ink: #16191d;
+    --muted: #5c6570;
+    --line: #dfe3e8;
+    --accent: #2c7aa8;
+    --ok: #1f7a4d;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  :root:not([data-theme="light"]) {
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171a;
+      --panel: #1c2024;
+      --ink: #e7eaee;
+      --muted: #9aa4ae;
+      --line: #2c3238;
+      --accent: #63b3dd;
+      --ok: #5cc08c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171a;
+    --panel: #1c2024;
+    --ink: #e7eaee;
+    --muted: #9aa4ae;
+    --line: #2c3238;
+    --accent: #63b3dd;
+    --ok: #5cc08c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 48px 24px 80px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 28px; margin-bottom: 36px; }
+  h1 { font-size: 34px; line-height: 1.2; margin: 0 0 10px; letter-spacing: -0.02em; }
+  h2 { font-size: 21px; margin: 44px 0 14px; letter-spacing: -0.01em; }
+  h3 { font-size: 15px; margin: 26px 0 8px; text-transform: uppercase;
+       letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 18px; color: var(--muted); margin-bottom: 18px; }
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); font-size: 0.9em; }
+  code { background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font-family: var(--mono);
+        font-size: 13px; line-height: 1.5; }
+
+  .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+           gap: 18px; margin: 22px 0; }
+  figure { margin: 0; }
+  figure img { width: 100%; height: auto; display: block; border: 1px solid var(--line);
+               border-radius: 8px; background: #fff; }
+  figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+
+  .tablewrap { overflow-x: auto; margin: 16px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 14px 9px 0; border-bottom: 1px solid var(--line); }
+  th { font-weight: 600; color: var(--muted); font-size: 12px;
+       text-transform: uppercase; letter-spacing: 0.05em; }
+  td.num { font-family: var(--mono); white-space: nowrap; }
+  .good { color: var(--ok); font-weight: 600; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+           gap: 14px; margin: 20px 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px 18px; }
+  .card .k { font-family: var(--mono); font-size: 24px; letter-spacing: -0.02em; }
+  .card .l { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+  ul { margin: 0 0 14px; padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 16px;
+          color: var(--muted); margin: 18px 0; }
+  footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Mesh to Part</h1>
+  <p class="lede">A Fusion 360 add-in that turns a scanned mesh into a solid or a
+  Form body under an explicit maximum-error budget — and measures the result
+  instead of assuming it.</p>
+  <p>Includes an organic mesh&nbsp;→&nbsp;Form conversion built from scratch, which
+  needs no Product Design Extension.</p>
+</header>
+
+<h2>The tool</h2>
+<figure>
+  <img src="img/Mesh_control_panel.PNG" alt="The Mesh to Part panel in Fusion, with a calcaneus mesh selected">
+  <figcaption>The panel reads the selected mesh, states the error budget in
+  millimetres, and lists only the conversion methods this licence can actually
+  run.</figcaption>
+</figure>
+
+<h2>The example</h2>
+<p>A 10 876-triangle calcaneus scan, 509&nbsp;×&nbsp;768&nbsp;×&nbsp;531&nbsp;mm,
+watertight, with a mean edge length of 15.7&nbsp;mm.</p>
+
+<div class="shots">
+  <figure>
+    <img src="img/mesh-iso.png" alt="The imported STL mesh of a calcaneus">
+    <figcaption>Input: the imported mesh body.</figcaption>
+  </figure>
+  <figure>
+    <img src="img/form-iso.png" alt="The resulting six-patch T-Spline Form body">
+    <figcaption>Output: a six-patch T-Spline Form body — watertight, solid,
+    editable with Fusion's sculpt tools.</figcaption>
+  </figure>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="k">6</div><div class="l">faces in the result</div></div>
+  <div class="card"><div class="k">1.14 mm</div><div class="l">RMS deviation</div></div>
+  <div class="card"><div class="k">1.92 mm</div><div class="l">p95 deviation</div></div>
+  <div class="card"><div class="k">0.23 %</div><div class="l">volume error</div></div>
+</div>
+
+<div class="shots">
+  <figure>
+    <img src="img/mesh-front.png" alt="Front view of the mesh">
+    <figcaption>Mesh, front.</figcaption>
+  </figure>
+  <figure>
+    <img src="img/form-front.png" alt="Front view of the Form body">
+    <figcaption>Form body, front.</figcaption>
+  </figure>
+  <figure>
+    <img src="img/form-right.png" alt="Right view of the Form body">
+    <figcaption>Form body, right — the four patch boundaries are the only edges.</figcaption>
+  </figure>
+</div>
+
+<h2>Four methods, one budget</h2>
+<p>Fusion's own <em>Convert&nbsp;Mesh&nbsp;→&nbsp;Organic</em> requires the Product
+Design Extension. Two of the four methods here are built into the add-in and need
+nothing.</p>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Method</th><th>Output</th><th>Extension</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Organic Form (T-Spline)</strong></td>
+        <td>a real Form body, six patches, sculptable</td>
+        <td class="good">not needed</td></tr>
+    <tr><td><strong>Organic NURBS</strong></td>
+        <td>a six-patch NURBS solid, watertight by construction</td>
+        <td class="good">not needed</td></tr>
+    <tr><td>Prismatic</td><td>Fusion's own — planes, cylinders, cones</td>
+        <td>not needed</td></tr>
+    <tr><td>Faceted</td><td>Fusion's own — one face per triangle, exact</td>
+        <td>not needed</td></tr>
+    <tr><td>Organic</td><td>Fusion's own T-Spline conversion</td>
+        <td>required</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Whichever you pick, the tool converts, measures the deviation <strong>both
+ways</strong> against the source mesh, and climbs an escalation ladder until the
+budget is met or the ladder runs out. The report always says which happened.</p>
+
+<h2>Measured accuracy</h2>
+<p>Every figure was measured inside Fusion against the source mesh.</p>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Input</th><th>Method</th><th>Max</th><th>RMS</th><th>p95</th>
+             <th>Volume error</th></tr></thead>
+  <tbody>
+    <tr><td>sphere ⌀30 mm</td><td>Form</td>
+        <td class="num">0.039 mm</td><td class="num">0.012 mm</td>
+        <td class="num">0.024 mm</td><td class="num">+0.04 %</td></tr>
+    <tr><td>sphere ⌀30 mm</td><td>NURBS</td>
+        <td class="num">0.012 mm</td><td class="num">0.004 mm</td>
+        <td class="num">—</td><td class="num">−0.02 %</td></tr>
+    <tr><td>capsule</td><td>NURBS</td>
+        <td class="num">0.121 mm</td><td class="num">0.021 mm</td>
+        <td class="num">—</td><td class="num">−0.01 %</td></tr>
+    <tr><td>calcaneus, 1063 mm diagonal</td><td>Form</td>
+        <td class="num">12.7 mm</td><td class="num">1.14 mm</td>
+        <td class="num">1.92 mm</td><td class="num">−0.23 %</td></tr>
+    <tr><td>calcaneus</td><td>NURBS</td>
+        <td class="num">12.9 mm</td><td class="num">0.87 mm</td>
+        <td class="num">1.28 mm</td><td class="num">−0.13 %</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="note">On the bone, judge by p95 and RMS. The max sits at a handful of
+isolated 150° creases in a mesh whose mean edge is 15.7&nbsp;mm — no smooth surface
+reproduces those, and Fusion's own Organic conversion would round them too.</p>
+
+<h2>How it works</h2>
+<p>A cube-sphere quad cage is shrink-wrapped onto the mesh, then relaxed
+<em>tangentially</em> so points slide along the surface into concavities instead of
+being lifted out of them. It lands on the mesh to 1e−11&nbsp;mm. From there:</p>
+<ul>
+  <li><strong>Form</strong> — the cage is solved so its Catmull-Clark <em>limit</em>
+  surface lands on the mesh, then written as TSM and handed to
+  <code>addByTSMDescription</code>. A subdivision surface does not pass through its
+  own control points, so emitting a cage that lies on the scan would put the body
+  several millimetres inside it.</li>
+  <li><strong>NURBS</strong> — each cube face becomes one bicubic patch fitted by
+  constrained least squares. Every shared cube edge is fitted <em>once</em> from
+  the row of cage points both patches share, so the body is watertight by
+  construction rather than by tolerance. <code>BRepBodyDefinition</code> assembles
+  8 vertices, 12 edges and 6 faces.</li>
+</ul>
+
+<h3>Verification</h3>
+<p>A cage of radius 2.0 emitted as TSM produced a body <strong>32.9146&nbsp;mm</strong>
+across; the Catmull-Clark limit maths predicts <strong>32.9146&nbsp;mm</strong>. A
+fitted 30&nbsp;mm sphere came back as <strong>29.9986&nbsp;mm</strong>.</p>
+
+<h2>Install</h2>
+<pre>git clone &lt;this repo&gt;
+powershell -File install.ps1
+pip install numpy scipy trimesh     # the fitting runs outside Fusion</pre>
+<p>Then in Fusion: <strong>Utilities → ADD-INS → Scripts and Add-Ins → Add-Ins →
+Mesh to Part → Run</strong>. The button appears in <strong>Mesh → Modify</strong>
+and <strong>Solid → Create</strong>.</p>
+
+<footer>
+  <p>Source and full write-ups:
+  <a href="../README.md">README</a> ·
+  <a href="ORGANIC.md">the organic conversion</a> ·
+  <a href="TSM-FORMAT.md">the TSM format, reverse engineered</a>.</p>
+  <p>MIT licensed.</p>
+</footer>
+
+</div>
+</body>
+</html>

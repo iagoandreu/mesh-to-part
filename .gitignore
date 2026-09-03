@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# runtime state, written next to the installed add-in
+devjobs/
+reports/
+MeshToPart.log
+last_settings.json
+
+# local machine configuration
+python_path.txt
+devbridge.on

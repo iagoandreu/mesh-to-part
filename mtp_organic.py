@@ -1,0 +1,1197 @@
+"""Organic conversion engine - runs OUTSIDE Fusion, under py -3.10.
+
+Fusion's Organic mesh conversion needs the Product Design Extension. This is a
+replacement built from scratch: it wraps a cube-sphere quad cage onto the mesh,
+fits one bicubic NURBS patch per cube face, and hands the six patches plus their
+shared boundary curves back so the add-in can assemble a real B-Rep solid.
+
+Why a cube-sphere and not a UV sphere: no pole singularity and no periodic seam,
+so every patch is a plain open bicubic surface and the topology is 6 faces,
+12 edges, 8 vertices - the simplest watertight quad layout that exists.
+
+Why the boundaries come out watertight: adjacent patches interpolate the *same*
+row of wrapped points, with the same uniform parameterisation and the same end
+conditions, so their shared boundary curve is identical by construction rather
+than by tolerance.
+
+Fusion's bundled interpreter has no numpy, hence the split. All lengths are
+centimetres, matching Fusion's internal unit.
+
+    py -3.10 mtp_organic.py job.json out.json
+"""
+
+import json
+import math
+import sys
+import time
+
+import numpy as np
+from scipy.interpolate import BSpline
+from scipy.spatial import cKDTree
+
+import trimesh
+
+
+# --------------------------------------------------------------------------- #
+# exact closest point on a triangle soup
+#
+# trimesh.proximity needs rtree, which is not installed here and is not worth
+# adding to the user's interpreter for this. A KD-tree over triangle centroids
+# shortlists candidates and the exact point-triangle projection finishes the job;
+# the shortlist radius is bounded so the answer is exact, not approximate.
+# --------------------------------------------------------------------------- #
+
+class Projector(object):
+    def __init__(self, mesh):
+        self.tri = np.asarray(mesh.triangles, float)          # (F, 3, 3)
+        self.a = self.tri[:, 0, :]
+        self.b = self.tri[:, 1, :]
+        self.c = self.tri[:, 2, :]
+        self.centroid = self.tri.mean(axis=1)
+        self.radius = float(np.linalg.norm(
+            self.tri - self.centroid[:, None, :], axis=2).max())
+        self.tree = cKDTree(self.centroid)
+        n = np.cross(self.b - self.a, self.c - self.a)
+        ln = np.linalg.norm(n, axis=1)
+        self.normal = n / np.maximum(ln, 1e-30)[:, None]
+
+    def __call__(self, points, k=24, exact=True):
+        points = np.asarray(points, float)
+        k = min(k, len(self.centroid))
+        d0, idx0 = self.tree.query(points, k=k, workers=-1)
+        if idx0.ndim == 1:
+            idx0 = idx0[:, None]
+        out_pts, out_d, out_f = self._batch(points, idx0)
+        # anything whose centroid is farther than this bound cannot win
+        bound = out_d + self.radius
+        if not exact:
+            return out_pts, out_d, out_f
+        far = d0[:, -1] < bound if d0.ndim > 1 else np.zeros(len(points), bool)
+        for i in np.nonzero(far)[0]:
+            cand = self.tree.query_ball_point(points[i], bound[i], workers=-1)
+            if len(cand) <= k:
+                continue
+            p, d, f = self._batch(points[i][None, :], np.array(cand)[None, :])
+            if d[0] < out_d[i]:
+                out_pts[i] = p[0]
+                out_d[i] = d[0]
+                out_f[i] = f[0]
+        return out_pts, out_d, out_f
+
+    def _batch(self, points, cand):
+        n, m = cand.shape
+        p = np.repeat(points, m, axis=0)
+        f = cand.reshape(-1)
+        q = closest_on_triangle(p, self.a[f], self.b[f], self.c[f])
+        d = np.linalg.norm(q - p, axis=1).reshape(n, m)
+        j = d.argmin(axis=1)
+        rows = np.arange(n)
+        return q.reshape(n, m, 3)[rows, j], d[rows, j], cand[rows, j]
+
+
+def closest_on_triangle(p, a, b, c):
+    """Vectorised closest point on a triangle (Ericson, Real-Time Collision
+    Detection 5.1.5). Regions are assigned in reverse priority so the highest
+    priority case is the one that survives."""
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = (ab * ap).sum(1)
+    d2 = (ac * ap).sum(1)
+    bp = p - b
+    d3 = (ab * bp).sum(1)
+    d4 = (ac * bp).sum(1)
+    cp = p - c
+    d5 = (ab * cp).sum(1)
+    d6 = (ac * cp).sum(1)
+    va = d3 * d6 - d5 * d4
+    vb = d5 * d2 - d1 * d6
+    vc = d1 * d4 - d3 * d2
+    denom = va + vb + vc
+    safe = np.where(np.abs(denom) < 1e-20, 1.0, denom)
+
+    v = vb / safe
+    w = vc / safe
+    out = a + ab * v[:, None] + ac * w[:, None]              # interior
+
+    # edge BC
+    d43 = d4 - d3
+    d56 = d5 - d6
+    t = np.where(np.abs(d43 - d56) < 1e-20, 0.0, d43 / np.where(
+        np.abs(d43 - d56) < 1e-20, 1.0, d43 - d56))
+    t = np.clip(t, 0.0, 1.0)
+    mBC = (va <= 0) & (d43 >= 0) & (d56 >= 0)
+    out = np.where(mBC[:, None], b + (c - b) * t[:, None], out)
+
+    # edge AC
+    tw = np.where(np.abs(d2 - d6) < 1e-20, 0.0,
+                  d2 / np.where(np.abs(d2 - d6) < 1e-20, 1.0, d2 - d6))
+    tw = np.clip(tw, 0.0, 1.0)
+    mAC = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+    out = np.where(mAC[:, None], a + ac * tw[:, None], out)
+
+    # edge AB
+    tv = np.where(np.abs(d1 - d3) < 1e-20, 0.0,
+                  d1 / np.where(np.abs(d1 - d3) < 1e-20, 1.0, d1 - d3))
+    tv = np.clip(tv, 0.0, 1.0)
+    mAB = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+    out = np.where(mAB[:, None], a + ab * tv[:, None], out)
+
+    out = np.where(((d6 >= 0) & (d5 <= d6))[:, None], c, out)
+    out = np.where(((d3 >= 0) & (d4 <= d3))[:, None], b, out)
+    out = np.where(((d1 <= 0) & (d2 <= 0))[:, None], a, out)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# the cage
+# --------------------------------------------------------------------------- #
+
+# Each cube face as (u_dir, v_dir, normal) with u x v == outward normal, so a
+# loop running u+ then v+ is counter-clockwise seen from outside and the patch
+# normal needs no flipping later.
+CUBE_FACES = [
+    ((0, 1, 0), (0, 0, 1), (1, 0, 0)),      # +X
+    ((0, 0, 1), (0, 1, 0), (-1, 0, 0)),     # -X
+    ((0, 0, 1), (1, 0, 0), (0, 1, 0)),      # +Y
+    ((1, 0, 0), (0, 0, 1), (0, -1, 0)),     # -Y
+    ((1, 0, 0), (0, 1, 0), (0, 0, 1)),      # +Z
+    ((0, 1, 0), (1, 0, 0), (0, 0, -1)),     # -Z
+]
+
+
+def cube_sphere(n):
+    """Cube-sphere cage with n+1 points per side per face.
+
+    Returns (verts, grids) where grids[f] is an (n+1, n+1) array of indices into
+    verts. Points on shared cube edges and corners resolve to the SAME index, so
+    the cage is one welded surface and the wrap can never tear it open.
+    """
+    t = np.linspace(-1.0, 1.0, n + 1)
+    lut = {}
+    verts = []
+    grids = []
+    for u_dir, v_dir, normal in CUBE_FACES:
+        u_dir = np.array(u_dir, float)
+        v_dir = np.array(v_dir, float)
+        normal = np.array(normal, float)
+        g = np.zeros((n + 1, n + 1), dtype=np.int64)
+        for i in range(n + 1):
+            for j in range(n + 1):
+                p = normal + u_dir * t[i] + v_dir * t[j]
+                key = (round(p[0], 9), round(p[1], 9), round(p[2], 9))
+                idx = lut.get(key)
+                if idx is None:
+                    idx = len(verts)
+                    lut[key] = idx
+                    verts.append(p)
+                g[i, j] = idx
+        grids.append(g)
+    verts = np.array(verts, float)
+    verts /= np.linalg.norm(verts, axis=1)[:, None]     # cube -> sphere
+    return verts, grids
+
+
+def cage_neighbours(n_verts, grids):
+    """Neighbour lists from the quad edges, used for Laplacian smoothing."""
+    nb = [set() for _ in range(n_verts)]
+    for g in grids:
+        n = g.shape[0]
+        for i in range(n):
+            for j in range(n):
+                a = g[i, j]
+                if i + 1 < n:
+                    b = g[i + 1, j]
+                    nb[a].add(b)
+                    nb[b].add(a)
+                if j + 1 < n:
+                    b = g[i, j + 1]
+                    nb[a].add(b)
+                    nb[b].add(a)
+    width = max(len(s) for s in nb)
+    table = np.full((n_verts, width), -1, dtype=np.int64)
+    for i, s in enumerate(nb):
+        for k, v in enumerate(sorted(s)):
+            table[i, k] = v
+    return table
+
+
+def laplacian(points, table):
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    acc = (points[safe] * valid[:, :, None]).sum(axis=1)
+    cnt = valid.sum(axis=1)[:, None].astype(float)
+    return acc / np.maximum(cnt, 1.0) - points
+
+
+def smooth(points, table, weight, normals=None):
+    """One Laplacian pass. With normals supplied only the TANGENTIAL part of the
+    displacement is applied, which is what lets the cage settle into concavities:
+    plain Laplacian smoothing lifts points off the surface and the projection then
+    drags them back to the nearest convex bit, so a hollow never gets filled."""
+    if weight <= 0.0:
+        return points
+    disp = laplacian(points, table)
+    if normals is not None:
+        disp = disp - (disp * normals).sum(axis=1)[:, None] * normals
+    return points + weight * disp
+
+
+# --------------------------------------------------------------------------- #
+# the wrap
+# --------------------------------------------------------------------------- #
+
+def neighbour_mean(values, table):
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    acc = (values[safe] * valid[:, :, None]).sum(axis=1)
+    cnt = valid.sum(axis=1)[:, None].astype(float)
+    return acc / np.maximum(cnt, 1.0)
+
+
+def spacing(points, table):
+    """Mean distance from each point to its cage neighbours."""
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    d = np.linalg.norm(points[safe] - points[:, None, :], axis=2) * valid
+    return d.sum(axis=1) / np.maximum(valid.sum(axis=1), 1)
+
+
+def spacing_cv(points, table):
+    """Coefficient of variation of cage edge length. This, not the Laplacian
+    magnitude, is what uniform-knot fitting actually cares about: a curved cage
+    has a large Laplacian even when it is perfectly evenly spaced."""
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    d = np.linalg.norm(points[safe] - points[:, None, :], axis=2)[valid]
+    return float(d.std() / max(d.mean(), 1e-30))
+
+
+def quad_arrays(grids):
+    """Flat arrays of the four corner indices of every cage quad, once."""
+    a, b, c, d = [], [], [], []
+    for g in grids:
+        n = g.shape[0] - 1
+        a.append(g[:n, :n].ravel())
+        b.append(g[1:, :n].ravel())      # +u
+        c.append(g[1:, 1:].ravel())      # +u +v
+        d.append(g[:n, 1:].ravel())      # +v
+    return (np.concatenate(a), np.concatenate(b),
+            np.concatenate(c), np.concatenate(d))
+
+
+def folded_quads(points, quads, proj=None):
+    """Which cage quads are turned inside out relative to their own neighbourhood.
+
+    Comparing a quad against the MESH normal underneath it looked like the obvious
+    test and it is wrong on a creased scan: a quad straddling a 150-degree crease
+    projects its centre onto one side or the other, and the mesh normal there can
+    oppose the quad's own average direction with nothing actually folded. That test
+    reported 2% of quads folded on a body whose volume was right to 0.16% and which
+    healed into a valid solid - false positives.
+
+    The intrinsic test compares each quad with the area-weighted vertex normals of
+    its own corners. A genuinely buckled quad opposes the field its neighbours
+    define; a quad sitting honestly across a crease does not. It needs no projection
+    either, so it is cheap enough to run inside every step.
+    """
+    a, b, c, d = quads
+    nq = np.cross(points[b] - points[a], points[d] - points[a])
+    ln = np.linalg.norm(nq, axis=1)
+    nq_unit = nq / np.maximum(ln, 1e-30)[:, None]
+
+    vn = np.zeros_like(points)
+    for arr in (a, b, c, d):
+        np.add.at(vn, arr, nq)              # area weighted: nq is not normalised
+    field = vn[a] + vn[b] + vn[c] + vn[d]
+    fl = np.linalg.norm(field, axis=1)
+    field = field / np.maximum(fl, 1e-30)[:, None]
+    return (nq_unit * field).sum(axis=1) < 0.0, ln
+
+
+def safe_step_mesh(points, step, quads, proj, tries=4, bad_before=None):
+    """Apply a displacement, backing off only where it would create a NEW fold.
+
+    Two things had to be right here. The cheap self-consistency test (did this
+    quad's normal flip during this step?) misses buckles that build up gradually,
+    which is exactly how they formed - the count climbed steadily while no single
+    step ever flipped anything. And backing off around quads that were ALREADY
+    folded starves those vertices of movement: with that bug the cage finished
+    72 mm short of the surface in places. So the comparison is against the surface
+    normal underneath, and only against folds this step is responsible for.
+    """
+    a, b, c, d = quads
+    if bad_before is None:
+        bad_before, _l = folded_quads(points, quads, proj)
+    scale = np.ones(len(points))
+    cand = points + step
+    for _ in range(tries):
+        bad, _ln = folded_quads(cand, quads, proj)
+        fresh = bad & ~bad_before
+        if not fresh.any():
+            return cand, bad
+        touched = np.zeros(len(points), bool)
+        for arr in (a, b, c, d):
+            touched[arr[fresh]] = True
+        scale[touched] *= 0.4
+        cand = points + step * scale[:, None]
+    bad, _ln = folded_quads(cand, quads, proj)
+    return cand, bad
+
+
+def untangle(points, table, quads, proj, passes, log):
+    """Iteratively unbuckle the cage, giving up accuracy locally to do it.
+
+    A folded quad is fatal for the Form output: Fusion rejects a self-intersecting
+    T-Spline with ASM_TSP_IG_SURFACE_PARALLEL_SINGULARITY and produces no body at
+    all. So this is not a quality nicety, it is a hard requirement.
+
+    The earlier version smoothed the folded region and then re-projected it onto
+    the mesh, which is why it stalled at 65 folds: the projection put the buckle
+    straight back. Here the folded neighbourhood is smoothed and deliberately left
+    OFF the surface, while everything else stays projected onto it. Trading a
+    little local fidelity for a body that exists is the right way round.
+    """
+    a, b, c, d = quads
+    n_before = None
+    weight = 0.5
+    for it in range(passes):
+        bad, _ln = folded_quads(points, quads, proj)
+        n_bad = int(bad.sum())
+        if n_before is None:
+            n_before = n_bad
+        if n_bad == 0:
+            break
+        touched = np.zeros(len(points), bool)
+        for arr in (a, b, c, d):
+            touched[arr[bad]] = True
+        for _ring in range(2):                 # widen so the repair is not a dent
+            nb = table[touched]
+            touched[nb[nb >= 0]] = True
+
+        disp = laplacian(points, table)
+        points = points + (weight * touched[:, None]) * disp
+        free = ~touched
+        if free.any():
+            pf, _dd, _ff = proj(points[free], k=16, exact=False)
+            points[free] = pf
+        weight = min(0.9, weight * 1.15)       # push harder if it is not clearing
+        if log and (it % 5 == 0 or it == passes - 1):
+            log('  untangle %2d/%d  folded quads %d  weight %.2f'
+                % (it + 1, passes, n_bad, weight))
+    bad, _ln = folded_quads(points, quads, proj)
+    if log:
+        log('  untangle: folded quads %s -> %d' % (n_before, int(bad.sum())))
+    return points, int(bad.sum())
+
+
+def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_end,
+                sample_count, tangential_iters, untangle_passes, log):
+    """Pull the cage onto the mesh, then let it slide along the surface.
+
+    Phase 1 - free wrap. A KD-tree over a dense surface sample drives it, which is
+    far cheaper than exact projection, and full Laplacian smoothing keeps the cage
+    from folding while it travels in from the enclosing sphere.
+
+    Phase 2 - tangential relaxation. Every point sits exactly on the mesh and only
+    slides along it. This is the phase that reaches into concavities: normal-
+    direction smoothing would lift a point out of a hollow and the projection would
+    then snap it back to the nearest convex face, so the hollow could never fill.
+    """
+    samples, _ = trimesh.sample.sample_surface(mesh, sample_count)
+    tree = cKDTree(samples)
+    quads = quad_arrays(grids)
+
+    for it in range(iters):
+        frac = it / max(1, iters - 1)
+        w = smooth_start + (smooth_end - smooth_start) * frac
+        _, idx = tree.query(points, k=1, workers=-1)
+        pull = 0.85 * (samples[idx] - points)
+        # A cage row that overshoots into a concavity crosses its neighbours and
+        # the cage buckles; most folds were being created right here, before the
+        # relaxation ever ran. Cap the advance at the local spacing and refuse any
+        # step that inverts a quad.
+        lim = 1.0 * spacing(points, table)
+        ln = np.linalg.norm(pull, axis=1)
+        pull *= np.minimum(1.0, lim / np.maximum(ln, 1e-30))[:, None]
+        points, bad_now = safe_step_mesh(points, pull, quads, proj)
+        sm = smooth(points, table, w) - points
+        points, bad_now = safe_step_mesh(points, sm, quads, proj,
+                                         bad_before=bad_now)
+        if log and (it % 10 == 0 or it == iters - 1):
+            d = np.linalg.norm(samples[idx] - points, axis=1)
+            bad, _l = folded_quads(points, quads, proj)
+            log('  wrap %3d/%d  smooth %.3f  residual max %.3f mean %.3f mm  folded %d'
+                % (it + 1, iters, w, d.max() * 10.0, d.mean() * 10.0, int(bad.sum())))
+
+    points, _d, fid = proj(points, k=16, exact=False)
+    bad0, _l = folded_quads(points, quads, proj)
+    if log:
+        log('  folded quads after the wrap: %d of %d' % (int(bad0.sum()), len(quads[0])))
+    for it in range(tangential_iters):
+        w = smooth_end + (smooth_start - smooth_end) *             (1.0 - it / max(1, tangential_iters - 1)) * 0.5
+        # Smooth the surface normal over the cage neighbourhood first. The raw
+        # face normal flips across a crease, which sends the tangential step in a
+        # different direction on every pass and makes the relaxation oscillate
+        # instead of settle.
+        nrm = proj.normal[fid]
+        nrm = nrm + neighbour_mean(nrm, table)
+        nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-30)[:, None]
+
+        disp = laplacian(points, table)
+        disp = disp - (disp * nrm).sum(axis=1)[:, None] * nrm
+        step = w * disp
+        # never move a point more than a fraction of its own spacing in one pass
+        lim = 0.35 * spacing(points, table)
+        ln = np.linalg.norm(step, axis=1)
+        scale = np.minimum(1.0, lim / np.maximum(ln, 1e-30))
+        points, _bad = safe_step_mesh(points, step * scale[:, None], quads, proj)
+        points, _d, fid = proj(points, k=16, exact=False)
+        if log and (it % 15 == 0 or it == tangential_iters - 1):
+            bad, _l = folded_quads(points, quads, proj)
+            log('  relax %3d/%d  w %.3f  spacing CV %.4f  folded %d'
+                % (it + 1, tangential_iters, w, spacing_cv(points, table),
+                   int(bad.sum())))
+    points, n_folded = untangle(points, table, quads, proj,
+                                int(untangle_passes), log)
+    points, _d, _f = proj(points)          # exact landing
+    return points, n_folded
+
+
+# --------------------------------------------------------------------------- #
+# the patches
+# --------------------------------------------------------------------------- #
+
+def clamped_knots(count, degree=3):
+    """Clamped uniform knot vector for `count` control points."""
+    inner = count - degree - 1
+    if inner < 0:
+        raise ValueError('need at least %d control points' % (degree + 1))
+    return np.concatenate([
+        np.zeros(degree + 1),
+        np.arange(1, inner + 1, dtype=float) / (inner + 1),
+        np.ones(degree + 1),
+    ])
+
+
+def design(count, m, degree=3):
+    """Basis matrix (m x count) at m uniform parameters, plus the knot vector."""
+    kv = clamped_knots(count, degree)
+    x = np.linspace(0.0, 1.0, m)
+    x[-1] = np.nextafter(1.0, 0.0)          # keep the last point inside the span
+    B = BSpline.design_matrix(x, kv, degree).toarray()
+    return B, kv
+
+
+def second_difference(count):
+    """Fairness operator. Penalising the second difference of the control net is
+    what stops a least-squares fit from ringing between samples."""
+    if count < 3:
+        return np.zeros((0, count))
+    D = np.zeros((count - 2, count))
+    for i in range(count - 2):
+        D[i, i] = 1.0
+        D[i, i + 1] = -2.0
+        D[i, i + 2] = 1.0
+    return D
+
+
+def fit_curve_fixed_ends(data, B, lam):
+    """Least-squares cubic B-spline through a row of points, with the two end
+    control points pinned to the end data points.
+
+    Pinning the ends is what makes three patches meeting at a cage corner agree on
+    that corner exactly, and computing this from the shared data row alone is what
+    makes two patches agree on the whole shared boundary.
+    """
+    m, P = B.shape
+    c = np.zeros((P, 3))
+    c[0] = data[0]
+    c[-1] = data[-1]
+    free = np.arange(1, P - 1)
+    if len(free) == 0:
+        return c
+    A = B[:, free]
+    rhs = data - np.outer(B[:, 0], c[0]) - np.outer(B[:, -1], c[-1])
+    D = second_difference(P)
+    Df = D[:, free]
+    Dk = D[:, 0:1] @ c[0][None, :] + D[:, -1:] @ c[-1][None, :]
+    # Stacked least squares, not the normal equations: forming A.T@A squares the
+    # condition number, and at high control density that alone was enough to put
+    # metres of ringing into the fit.
+    lhs = np.vstack([A, math.sqrt(lam) * Df])
+    r = np.vstack([rhs, -math.sqrt(lam) * Dk])
+    c[free] = np.linalg.lstsq(lhs, r, rcond=None)[0]
+    return c
+
+
+def fit_patch_constrained(data, B, lam, bnd_u0, bnd_u1, bnd_v0, bnd_v1):
+    """Least-squares bicubic patch with all four boundary control rows given.
+
+    data is (m, m, 3) indexed [u][v]; the returned net is (P, P, 3) indexed [u][v].
+    Interior control points solve  min ||Bu C Bv^T - D||^2 + lam * fairness  with
+    the boundary entries held at the values the shared edge fits produced.
+    """
+    m, P = B.shape
+    C = np.zeros((P, P, 3))
+    C[0, :, :] = bnd_u0
+    C[-1, :, :] = bnd_u1
+    C[:, 0, :] = bnd_v0
+    C[:, -1, :] = bnd_v1
+
+    mask = np.ones((P, P), bool)
+    mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = False
+    free = np.flatnonzero(mask.ravel())
+    if len(free) == 0:
+        return C
+
+    K = np.kron(B, B)                            # (m*m, P*P), row = u*m+v
+    D2 = second_difference(P)
+    I = np.eye(P)
+    S = np.vstack([np.kron(D2, I), np.kron(I, D2)])
+
+    A = K[:, free]
+    fixed = np.flatnonzero(~mask.ravel())
+    known = C.reshape(-1, 3)[fixed]
+    rhs = data.reshape(-1, 3) - K[:, fixed] @ known
+    Sf = S[:, free]
+    Sk = S[:, fixed] @ known
+    w = math.sqrt(lam)
+    sol = np.linalg.lstsq(np.vstack([A, w * Sf]),
+                          np.vstack([rhs, -w * Sk]), rcond=None)[0]
+    flat = C.reshape(-1, 3)
+    flat[free] = sol
+    return flat.reshape(P, P, 3)
+
+
+def eval_surface(net, knots_u, knots_v, nu, nv):
+    """Sample the fitted surface, so its accuracy can be measured before Fusion
+    ever sees it. net is indexed [u][v]; the result is indexed [u][v] too."""
+    qu = np.linspace(0.0, 1.0, nu)
+    qv = np.linspace(0.0, 1.0, nv)
+    qu[-1] = qv[-1] = np.nextafter(1.0, 0.0)
+    Bu = BSpline.design_matrix(qu, knots_u, 3).toarray()
+    Bv = BSpline.design_matrix(qv, knots_v, 3).toarray()
+    out = np.empty((nu, nv, 3))
+    for d in range(3):
+        out[:, :, d] = Bu @ net[:, :, d] @ Bv.T
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# TSM writer - the real Form (T-Spline) output
+#
+# The format is undocumented; it was reverse engineered from one hand-made Quad
+# Ball. It is plain text, a half-edge ("link") structure:
+#
+#   f <a link of this face> 0
+#   e <a link of this edge> 1            1 = smooth, 0 = creased
+#   v <a link of this vertex> NORTH
+#   l <next> <prev> <mate> <vertex> <face> <edge> 0
+#   0g <x> <y> <z> <w>                   one per vertex, in v order
+#
+# Verified against the sample: `next` and `prev` are inverses, `mate` is an
+# involution that shares the edge and belongs to the other face, and `vertex` is
+# the link's DESTINATION (vert[mate] == vert[prev]). The `next` loop runs
+# CLOCKWISE seen from outside on all 24 faces of the sample, which is the
+# opposite of the CUBE_FACES convention used everywhere else here, so the loops
+# are emitted reversed.
+# --------------------------------------------------------------------------- #
+
+TSM_HEADER = """#TS0200
+
+degree 3
+cap-type G1CAPS
+star-smoothness 0
+units 1 meters
+end-conditions SUBD_CREASES
+star-knot-rule NURCCS"""
+
+TSM_FOOTER = """tol 1.00000000000000008e-05
+geom-tol 1.00000000000000008e-05
+ver 1044
+behavior-version 14.2.0
+compat-version 13.3.0"""
+
+
+def cage_quads(grids):
+    """Every cage quad as a 4-tuple of vertex indices, wound +u then +v."""
+    out = []
+    for g in grids:
+        n = g.shape[0] - 1
+        for i in range(n):
+            for j in range(n):
+                out.append((int(g[i, j]), int(g[i + 1, j]),
+                            int(g[i + 1, j + 1]), int(g[i, j + 1])))
+    return out
+
+
+def write_tsm(points, quads, scale=1.0):
+    """Serialise a quad cage as a T-Spline control mesh."""
+    # reversed: our quads are counter-clockwise from outside, TSM wants clockwise
+    quads = [(q[0], q[3], q[2], q[1]) for q in quads]
+
+    edge_id = {}
+    for q in quads:
+        for k in range(4):
+            key = (q[k], q[(k + 1) % 4])
+            key = key if key[0] < key[1] else (key[1], key[0])
+            if key not in edge_id:
+                edge_id[key] = len(edge_id)
+
+    n_links = 4 * len(quads)
+    nxt = [0] * n_links
+    prv = [0] * n_links
+    mate = [-1] * n_links
+    dest = [0] * n_links
+    fidx = [0] * n_links
+    eidx = [0] * n_links
+    by_edge = {}
+    for f, q in enumerate(quads):
+        for k in range(4):
+            i = 4 * f + k
+            nxt[i] = 4 * f + (k + 1) % 4
+            prv[i] = 4 * f + (k + 3) % 4
+            dest[i] = q[(k + 1) % 4]          # link runs q[k] -> q[k+1]
+            fidx[i] = f
+            key = (q[k], q[(k + 1) % 4])
+            key = key if key[0] < key[1] else (key[1], key[0])
+            eidx[i] = edge_id[key]
+            by_edge.setdefault(edge_id[key], []).append(i)
+    for e, ls in by_edge.items():
+        if len(ls) != 2:
+            raise ValueError('edge %d has %d links; the cage is not a closed '
+                             'manifold quad mesh' % (e, len(ls)))
+        mate[ls[0]], mate[ls[1]] = ls[1], ls[0]
+
+    face_link = [4 * f for f in range(len(quads))]
+    edge_link = [by_edge[e][0] for e in range(len(edge_id))]
+    vert_link = {}
+    for i in range(n_links):
+        vert_link.setdefault(dest[i], i)
+    n_verts = len(points)
+    missing = [v for v in range(n_verts) if v not in vert_link]
+    if missing:
+        raise ValueError('%d cage vertices are not referenced by any quad'
+                         % len(missing))
+
+    out = [TSM_HEADER]
+    for i in face_link:
+        out.append('f %d 0' % i)
+    for i in edge_link:
+        out.append('e %d 1' % i)
+    for v in range(n_verts):
+        out.append('v %d NORTH' % vert_link[v])
+    for i in range(n_links):
+        out.append('l %d %d %d %d %d %d 0'
+                   % (nxt[i], prv[i], mate[i], dest[i], fidx[i], eidx[i]))
+    out.append('')
+    for v in range(n_verts):
+        p = points[v]
+        out.append('0g %.17g %.17g %.17g 1'
+                   % (p[0] * scale, p[1] * scale, p[2] * scale))
+    out.append('')
+    out.append(TSM_FOOTER)
+    return '\n'.join(out) + '\n'
+
+
+def limit_positions(points, quads_arr, table):
+    """Catmull-Clark limit points of a quad control cage.
+
+    P_limit = (n^2 P + 4 * sum(adjacent) + sum(diagonal)) / (n (n + 5)).
+    For a regular vertex that is the familiar (16 P + 4 sum_edge + sum_diag)/36.
+    This is what makes it possible to fit the cage so the SURFACE lands on the
+    mesh: a subdivision surface does not pass through its own control points.
+    """
+    a, b, c, d = quads_arr
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    adj = (points[safe] * valid[:, :, None]).sum(axis=1)
+    n = valid.sum(axis=1).astype(float)
+
+    diag = np.zeros_like(points)
+    for src, opp in ((a, c), (b, d), (c, a), (d, b)):
+        np.add.at(diag, src, points[opp])
+
+    n2 = n[:, None] ** 2
+    return (n2 * points + 4.0 * adj + diag) / (n[:, None] * (n[:, None] + 5.0))
+
+
+def neighbours_from_quads(n_verts, quads):
+    """Ragged neighbour table for an arbitrary quad mesh."""
+    nb = [set() for _ in range(n_verts)]
+    for q in quads:
+        for k in range(4):
+            u, v = q[k], q[(k + 1) % 4]
+            nb[u].add(v)
+            nb[v].add(u)
+    width = max(len(x) for x in nb)
+    tab = np.full((n_verts, width), -1, dtype=np.int64)
+    for i, x in enumerate(nb):
+        for k, v in enumerate(sorted(x)):
+            tab[i, k] = v
+    return tab
+
+
+def catmull_clark(points, quads):
+    """One Catmull-Clark subdivision step on a closed quad mesh.
+
+    Needed to measure the Form output honestly: a T-Spline body is the limit
+    surface of its control cage, so the cage itself is not what has to match the
+    scan. Subdividing twice and taking limit points gives a dense, faithful
+    sample of the surface Fusion will actually build.
+    """
+    pts = list(points)
+    face_pt = {}
+    for f, q in enumerate(quads):
+        face_pt[f] = len(pts)
+        pts.append(sum(points[i] for i in q) / 4.0)
+
+    edge_faces = {}
+    for f, q in enumerate(quads):
+        for k in range(4):
+            u, v = q[k], q[(k + 1) % 4]
+            key = (u, v) if u < v else (v, u)
+            edge_faces.setdefault(key, []).append(f)
+
+    edge_pt = {}
+    for key, fs in edge_faces.items():
+        u, v = key
+        acc = points[u] + points[v]
+        for f in fs:
+            acc = acc + pts[face_pt[f]]
+        edge_pt[key] = len(pts)
+        pts.append(acc / (2.0 + len(fs)))
+
+    # move the originals
+    n_orig = len(points)
+    F_acc = np.zeros((n_orig, 3))
+    R_acc = np.zeros((n_orig, 3))
+    val = np.zeros(n_orig)
+    for f, q in enumerate(quads):
+        for i in q:
+            F_acc[i] += pts[face_pt[f]]
+    for key, fs in edge_faces.items():
+        u, v = key
+        mid = 0.5 * (points[u] + points[v])
+        R_acc[u] += mid
+        R_acc[v] += mid
+        val[u] += 1
+        val[v] += 1
+    n = np.maximum(val, 1)[:, None]
+    moved = (F_acc / n + 2.0 * (R_acc / n) + (n - 3.0) * points) / n
+
+    new_pts = np.array(pts)
+    new_pts[:n_orig] = moved
+
+    new_quads = []
+    for f, q in enumerate(quads):
+        fp = face_pt[f]
+        for k in range(4):
+            u = q[k]
+            prev_key = (q[k - 1], u) if q[k - 1] < u else (u, q[k - 1])
+            next_key = (u, q[(k + 1) % 4]) if u < q[(k + 1) % 4] else (q[(k + 1) % 4], u)
+            new_quads.append((u, edge_pt[next_key], fp, edge_pt[prev_key]))
+    return new_pts, new_quads
+
+
+def limit_surface_mesh(points, quads, levels=2):
+    """Dense triangle mesh of the T-Spline limit surface, for measurement."""
+    p, q = np.asarray(points, float), list(quads)
+    for _ in range(levels):
+        p, q = catmull_clark(p, q)
+    tab = neighbours_from_quads(len(p), q)
+    qa = (np.array([x[0] for x in q]), np.array([x[1] for x in q]),
+          np.array([x[2] for x in q]), np.array([x[3] for x in q]))
+    lim = limit_positions(p, qa, tab)
+    tris = []
+    for a, b, c, d in q:
+        tris.append((a, b, c))
+        tris.append((a, c, d))
+    return lim, np.array(tris, dtype=np.int64)
+
+
+def limit_matrix(n_verts, quads_arr, table):
+    """The Catmull-Clark limit operator as a sparse matrix, so the cage can be
+    SOLVED for rather than relaxed toward."""
+    from scipy.sparse import coo_matrix
+    a, b, c, d = quads_arr
+    val = (table >= 0)
+    n = val.sum(axis=1).astype(float)
+    denom = n * (n + 5.0)
+
+    rows = [np.arange(n_verts)]
+    cols = [np.arange(n_verts)]
+    data = [n * n / denom]
+
+    for k in range(table.shape[1]):
+        m = val[:, k]
+        idx = np.flatnonzero(m)
+        rows.append(idx)
+        cols.append(table[idx, k])
+        data.append(4.0 / denom[idx])
+
+    for src, opp in ((a, c), (b, d), (c, a), (d, b)):
+        rows.append(src)
+        cols.append(opp)
+        data.append(1.0 / denom[src])
+
+    return coo_matrix((np.concatenate(data),
+                       (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(n_verts, n_verts)).tocsc()
+
+
+def graph_laplacian(n_verts, table):
+    """Uniform graph Laplacian of the cage, used to keep the control net tame."""
+    from scipy.sparse import coo_matrix
+    val = table >= 0
+    n = val.sum(axis=1).astype(float)
+    rows = [np.arange(n_verts)]
+    cols = [np.arange(n_verts)]
+    data = [np.ones(n_verts)]
+    for k in range(table.shape[1]):
+        m = val[:, k]
+        idx = np.flatnonzero(m)
+        rows.append(idx)
+        cols.append(table[idx, k])
+        data.append(-1.0 / n[idx])
+    return coo_matrix((np.concatenate(data),
+                       (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(n_verts, n_verts)).tocsc()
+
+
+def fit_limit_to_mesh(points, quads_arr, table, proj, iters, lam=1.0e-3, log=None):
+    """Solve for the control cage whose LIMIT surface sits on the mesh.
+
+    A T-Spline body is the limit surface of its cage, and a subdivision surface
+    does not pass through its own control points - a cage lying exactly on the
+    scan gives a body several millimetres inside it. So the cage must be solved
+    for, not relaxed toward: relaxing diverges here because the limit mask puts
+    only n/(n+5) on the diagonal and the rest on the neighbours, leaving Jacobi
+    nothing to lean on (the sphere test came out 536% over volume).
+
+    The solve is regularised. Solving L C = T exactly makes the control net
+    overshoot wherever the surface is concave, and that multiplied the number of
+    buckled quads by five to six - fatal, because Fusion refuses to build a body
+    from a self-intersecting T-Spline. Minimising ||L C - T||^2 + lam ||D C||^2
+    keeps the net tame; the caller raises lam until no quad is folded.
+    """
+    from scipy.sparse.linalg import spsolve
+    L = limit_matrix(len(points), quads_arr, table)
+    D = graph_laplacian(len(points), table)
+    A = (L.T @ L + lam * (D.T @ D)).tocsc()
+    for it in range(iters):
+        lim = L @ points
+        tgt, dist, _f = proj(lim, k=16, exact=False)
+        rhs = L.T @ tgt
+        points = np.column_stack([spsolve(A, rhs[:, k]) for k in range(3)])
+        if log and (it % 5 == 0 or it == iters - 1):
+            log('  limit fit %2d/%d  lam %.1e  surface-at-cage max %.4f mean %.4f mm'
+                % (it + 1, iters, lam, dist.max() * 10.0, dist.mean() * 10.0))
+    lim = L @ points
+    _t, dist, _f = proj(lim)
+    return points, float(dist.max() * 10.0), float(dist.mean() * 10.0)
+
+
+def untangle_cage(points, table, quads, passes, log=None):
+    """Unbuckle a CONTROL cage with purely local smoothing and no projection.
+
+    The wrapped-cage untangler re-projects onto the mesh, which is exactly wrong
+    here: a fitted control net does not lie on the mesh, its limit surface does.
+    Smoothing only the folded neighbourhoods leaves the rest of the fit untouched,
+    so the accuracy cost stays local instead of global - raising the solve's
+    regularisation until folds cleared cost a factor of four in RMS.
+    """
+    a, b, c, d = quads
+    weight = 0.5
+    first = None
+    for it in range(passes):
+        bad, _l = folded_quads(points, quads)
+        n_bad = int(bad.sum())
+        if first is None:
+            first = n_bad
+        if n_bad == 0:
+            break
+        touched = np.zeros(len(points), bool)
+        for arr in (a, b, c, d):
+            touched[arr[bad]] = True
+        for _ring in range(2):
+            nb = table[touched]
+            touched[nb[nb >= 0]] = True
+        points = points + (weight * touched[:, None]) * laplacian(points, table)
+        weight = min(0.95, weight * 1.1)
+    bad, _l = folded_quads(points, quads)
+    if log:
+        log('  cage untangle: folded quads %s -> %d' % (first, int(bad.sum())))
+    return points, int(bad.sum())
+
+
+def fit_limit_unfolded(points, quads_arr, table, proj, iters, lam0, passes,
+                       log=None):
+    """Fit the limit surface, then clear any buckle it introduced.
+
+    Solving L C = T exactly makes the control net overshoot wherever the surface
+    is concave: measured on the calcaneus it turned 1-21 folded quads into 28-130.
+    A light regularisation plus a LOCAL untangle of the result keeps the accuracy
+    the fit earned; only if folds survive does the regularisation go up.
+    """
+    lam = lam0
+    best = None
+    for attempt in range(5):
+        pts, mx, mn = fit_limit_to_mesh(points, quads_arr, table, proj, iters,
+                                        lam=lam, log=log if attempt == 0 else None)
+        pts, n_bad = untangle_cage(pts, table, quads_arr, passes, log)
+        if best is None or n_bad < best[3]:
+            best = (pts, mx, mn, n_bad, lam)
+        if n_bad == 0:
+            return pts, mx, mn, 0, lam
+        if log:
+            log('  %d folds survive at lam %.1e; raising it' % (n_bad, lam))
+        lam *= 6.0
+    return best
+
+
+def build(job, log):
+    t0 = time.time()
+    coords = np.array(job['coords'], float).reshape(-1, 3)
+    faces = np.array(job['idx'], np.int64).reshape(-1, 3)
+    mesh = trimesh.Trimesh(vertices=coords, faces=faces, process=True)
+    log('mesh %d verts %d faces watertight=%s'
+        % (len(mesh.vertices), len(mesh.faces), mesh.is_watertight))
+
+    n = int(job.get('cage', 24))
+    m = n + 1
+    verts, grids = cube_sphere(n)
+    table = cage_neighbours(len(verts), grids)
+
+    centre = mesh.bounding_box.centroid
+    radius = float(np.linalg.norm(mesh.vertices - centre, axis=1).max()) * 1.05
+    points = verts * radius + centre
+    log('cage %d verts, start sphere r=%.2f mm' % (len(points), radius * 10.0))
+
+    proj = Projector(mesh)
+    points, cage_folds = shrink_wrap(
+        mesh, proj, points, table, grids,
+        iters=int(job.get('wrap_iters', 50)),
+        smooth_start=float(job.get('smooth_start', 0.55)),
+        smooth_end=float(job.get('smooth_end', 0.06)),
+        sample_count=int(job.get('samples', 120000)),
+        tangential_iters=int(job.get('relax_iters', 60)),
+        untangle_passes=int(job.get('untangle', 12)),
+        log=log)
+    _c, dcage, _f = proj(points)
+    log('cage sits on the mesh to %.5f mm' % (dcage.max() * 10.0))
+
+    # ---- Form / T-Spline output -------------------------------------------- #
+    if job.get('output') == 'tsm':
+        quads = cage_quads(grids)
+        qa = quad_arrays(grids)
+        pts, lim_max, lim_mean, lim_folds, lam_used = fit_limit_unfolded(
+            points, qa, table, proj, int(job.get('limit_iters', 20)),
+            float(job.get('limit_fair', 1.0e-3)),
+            int(job.get('cage_untangle', 60)), log)
+        log('control cage fitted so the LIMIT surface lands on the mesh')
+
+        lim_pts, lim_tris = limit_surface_mesh(pts, quads,
+                                               int(job.get('eval_levels', 2)))
+        _c, d_out, _f = proj(lim_pts)
+        surf = trimesh.Trimesh(vertices=lim_pts, faces=lim_tris, process=False)
+        proj_s = Projector(surf)
+        probe, _fi = trimesh.sample.sample_surface(mesh, int(job.get('probe', 60000)))
+        probe = np.vstack([probe, mesh.vertices])
+        _c2, d_back, _f2 = proj_s(probe)
+        folded, _l = folded_quads(pts, qa)
+
+
+        return {
+            'tsm': write_tsm(pts, quads),
+            'cage_points': pts.tolist(),
+            'stats': {
+                'output': 'tsm',
+                'cage': n,
+                'cage_verts': int(len(pts)),
+                'cage_quads': int(len(quads)),
+                'cage_folded_quads': int(folded.sum()),
+                'limit_regularisation': lam_used,
+                'limit_at_cage_max_mm': lim_max,
+                'limit_at_cage_mean_mm': lim_mean,
+                'surface_tris': int(len(lim_tris)),
+                'probe_points': int(len(probe)),
+                'signed_volume_mm3': float(surf.volume) * 1000.0,
+                'mesh_volume_mm3': float(mesh.volume) * 1000.0,
+                'winding_consistent': bool(surf.is_winding_consistent),
+                'surf_to_mesh_max_mm': float(d_out.max() * 10.0),
+                'surf_to_mesh_p99_mm': float(np.percentile(d_out, 99) * 10.0),
+                'surf_to_mesh_rms_mm': float(np.sqrt((d_out ** 2).mean()) * 10.0),
+                'mesh_to_surf_max_mm': float(d_back.max() * 10.0),
+                'mesh_to_surf_p99_mm': float(np.percentile(d_back, 99) * 10.0),
+                'mesh_to_surf_rms_mm': float(np.sqrt((d_back ** 2).mean()) * 10.0),
+                'within_0p5_pct': float((d_out * 10.0 < 0.5).mean() * 100.0),
+                'within_1_pct': float((d_out * 10.0 < 1.0).mean() * 100.0),
+                'within_2_pct': float((d_out * 10.0 < 2.0).mean() * 100.0),
+                'secs': round(time.time() - t0, 2),
+            },
+        }
+
+    P = int(job.get('ctrl', max(8, int(round(0.7 * m)))))
+    P = max(6, min(P, m))
+    lam = float(job.get('fair', 2.0e-4))
+    B, kv = design(P, m)
+    log('fit: %d data / %d control points per side, fairness %.2e' % (m, P, lam))
+
+    # every cube edge is fitted ONCE, from the shared row of cage points, so the
+    # two patches that meet there get the identical boundary curve
+    edge_cache = {}
+
+    def edge_controls(ids, data):
+        a, b = int(ids[0]), int(ids[-1])
+        flip = a > b
+        key = (b, a) if flip else (a, b)
+        if key not in edge_cache:
+            edge_cache[key] = fit_curve_fixed_ends(
+                data[::-1] if flip else data, B, lam)
+        c = edge_cache[key]
+        return c[::-1] if flip else c
+
+    patch_nets = []
+    face_loops = []
+    for f, g in enumerate(grids):
+        D = points[g]                                     # (m, m, 3) as [u][v]
+        C = fit_patch_constrained(
+            D, B, lam,
+            edge_controls(g[0, :], D[0, :, :]),
+            edge_controls(g[-1, :], D[-1, :, :]),
+            edge_controls(g[:, 0], D[:, 0, :]),
+            edge_controls(g[:, -1], D[:, -1, :]))
+        patch_nets.append(C)
+
+        # Loop counter-clockwise in (u, v). u x v is the outward normal by the way
+        # CUBE_FACES is built, so this loop is counter-clockwise seen from outside
+        # and no face needs its parameterisation reversed.
+        walk = [
+            (int(g[0, 0]), int(g[-1, 0])),        # v=0, u rising
+            (int(g[-1, 0]), int(g[-1, -1])),      # u=1, v rising
+            (int(g[-1, -1]), int(g[0, -1])),      # v=1, u falling
+            (int(g[0, -1]), int(g[0, 0])),        # u=0, v falling
+        ]
+        loop = []
+        for a, b in walk:
+            flip = a > b
+            key = '%d-%d' % ((b, a) if flip else (a, b))
+            loop.append({'edge': key, 'reversed': bool(flip)})
+        face_loops.append(loop)
+
+    corners = sorted({int(v) for g in grids
+                      for v in (g[0, 0], g[-1, 0], g[-1, -1], g[0, -1])})
+    topo = {
+        'vertices': {str(c): (points[c]).tolist() for c in corners},
+        'edges': {('%d-%d' % k): {'controlPoints': v.tolist(),
+                                  'knots': kv.tolist(), 'degree': 3,
+                                  'start': k[0], 'end': k[1]}
+                  for k, v in edge_cache.items()},
+        'faces': face_loops,
+    }
+
+    # Measure both ways against a TESSELLATION of the fitted surface, not against
+    # a point sample of it: nearest-sample distance charges the fit for the
+    # sampling gaps, which on a part this size was worth several millimetres.
+    grid_res = int(job.get('eval_res', 4 * n))
+    verts_s, tris_s = [], []
+    base = 0
+    for C in patch_nets:
+        e = eval_surface(C, kv, kv, grid_res, grid_res)
+        verts_s.append(e.reshape(-1, 3))
+        r = grid_res
+        ii, jj = np.meshgrid(np.arange(r - 1), np.arange(r - 1), indexing='ij')
+        a = (base + ii * r + jj).ravel()
+        b = (base + ii * r + jj + 1).ravel()
+        c = (base + (ii + 1) * r + jj + 1).ravel()
+        d = (base + (ii + 1) * r + jj).ravel()
+        # a=(u,v)  b=(u,v+1)  c=(u+1,v+1)  d=(u+1,v).  Winding a-d-c / a-c-b gives
+        # the normal along +u x +v, which CUBE_FACES defines as outward.
+        tris_s.append(np.concatenate([np.stack([a, d, c], 1),
+                                      np.stack([a, c, b], 1)]))
+        base += r * r
+    verts_s = np.vstack(verts_s)
+    tris_s = np.vstack(tris_s)
+
+    # Orientation check. Comparing surface facets against the mesh normal was
+    # tried and dropped: on a creased scan it flags facets that are perfectly fine,
+    # the same false positive the cage fold test had. Signed volume against the
+    # mesh volume is the honest global statement, and the intrinsic cage fold count
+    # is the honest local one.
+    surf_mesh_tmp = trimesh.Trimesh(vertices=verts_s, faces=tris_s, process=False)
+    signed_vol = float(surf_mesh_tmp.volume)
+
+    _c, d_out, _f = proj(verts_s)                          # surface -> mesh
+    proj_s = Projector(trimesh.Trimesh(vertices=verts_s, faces=tris_s,
+                                       process=False))
+    probe, _fi = trimesh.sample.sample_surface(mesh, int(job.get('probe', 60000)))
+    probe = np.vstack([probe, mesh.vertices])
+    _c2, d_back, _f2 = proj_s(probe)                       # mesh -> surface
+
+    patches = []
+    for C in patch_nets:
+        patches.append({
+            'controlPoints': C.reshape(-1, 3).tolist(),    # [u][v], u major
+            'countU': int(C.shape[0]),
+            'countV': int(C.shape[1]),
+            'knotsU': kv.tolist(),
+            'knotsV': kv.tolist(),
+            'degree': 3,
+        })
+
+    result = {
+        'patches': patches,
+        'topology': topo,
+        'grids': [g.tolist() for g in grids],
+        'cage_points': points.tolist(),
+        'stats': {
+            'cage': n,
+            'cage_verts': int(len(points)),
+            'control_per_side': P,
+            'fairness': lam,
+            'cage_on_mesh_max_mm': float(dcage.max() * 10.0),
+            'cage_folded_quads': int(cage_folds),
+            'signed_volume_mm3': signed_vol * 1000.0,
+            'mesh_volume_mm3': float(mesh.volume) * 1000.0,
+            'winding_consistent': bool(surf_mesh_tmp.is_winding_consistent),
+            'surface_tris': int(len(tris_s)),
+            'probe_points': int(len(probe)),
+            'surf_to_mesh_max_mm': float(d_out.max() * 10.0),
+            'surf_to_mesh_p99_mm': float(np.percentile(d_out, 99) * 10.0),
+            'surf_to_mesh_rms_mm': float(np.sqrt((d_out ** 2).mean()) * 10.0),
+            'mesh_to_surf_max_mm': float(d_back.max() * 10.0),
+            'mesh_to_surf_p99_mm': float(np.percentile(d_back, 99) * 10.0),
+            'mesh_to_surf_rms_mm': float(np.sqrt((d_back ** 2).mean()) * 10.0),
+            'within_0p5_pct': float((d_out * 10.0 < 0.5).mean() * 100.0),
+            'within_1_pct': float((d_out * 10.0 < 1.0).mean() * 100.0),
+            'within_2_pct': float((d_out * 10.0 < 2.0).mean() * 100.0),
+            'worst_at_mm': (np.asarray(verts_s[int(d_out.argmax())]) * 10.0).tolist(),
+            'secs': round(time.time() - t0, 2),
+        },
+    }
+    return result
+
+
+def main():
+    job = json.load(open(sys.argv[1], encoding='utf-8'))
+    lines = []
+
+    def log(msg):
+        lines.append(msg)
+        print(msg, flush=True)
+
+    try:
+        res = build(job, log)
+        res['log'] = lines
+        res['ok'] = True
+    except Exception:
+        import traceback
+        res = {'ok': False, 'error': traceback.format_exc(), 'log': lines}
+    with open(sys.argv[2], 'w', encoding='utf-8') as fh:
+        json.dump(res, fh)
+
+
+if __name__ == '__main__':
+    main()

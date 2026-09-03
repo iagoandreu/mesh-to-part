@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "20523d20-a561-421b-8b8b-95d7bdf060eb",
+    "author": "Iago Andreu",
+    "description": {
+        "": "Convert an imported mesh body (STL) into a Form / solid part under an explicit maximum-error budget, with gap handling and a measured deviation report."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
