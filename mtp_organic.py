@@ -337,15 +337,22 @@ def quad_metrics(points, quads):
 
 def aspect_report(points, quads, limit):
     aspect, skew, eu, ev = quad_metrics(points, quads)
+    L = edge_lengths(points, quads)
+    ratio = L.max(axis=1) / np.maximum(L.min(axis=1), 1.0e-30)
     return {
-        'min_edge_mm': float(min(eu.min(), ev.min())) * 10.0,
-        'median_edge_mm': float(np.median(np.concatenate([eu, ev]))) * 10.0,
+        # the limit applies to the EDGE RATIO within a quad -- that is the
+        # property that decides whether an element is usable
+        'ratio_median': float(np.median(ratio)),
+        'ratio_p95': float(np.percentile(ratio, 95)),
+        'ratio_max': float(ratio.max()),
+        'over_limit': int((ratio > limit).sum()),
+        'min_edge_mm': float(L.min()) * 10.0,
+        'median_edge_mm': float(np.median(L)) * 10.0,
         'aspect_median': float(np.median(aspect)),
         'aspect_p95': float(np.percentile(aspect, 95)),
         'aspect_max': float(aspect.max()),
         'skew_p95': float(np.percentile(skew, 95)),
         'skew_max': float(skew.max()),
-        'over_limit': int((aspect > limit).sum()),
         'quads': int(len(aspect)),
         'limit': float(limit),
     }
@@ -359,9 +366,8 @@ def vertex_badness(points, quads, n_verts, limit):
     cage alone rather than smoothing everything and washing out the detail that
     was already landing correctly.
     """
-    aspect, skew, _eu, _ev = quad_metrics(points, quads)
-    bad = np.maximum(aspect / max(limit, 1.0e-9) - 1.0, 0.0)
-    bad = bad + 2.0 * np.maximum(skew - 0.5, 0.0)
+    ratio = edge_ratio(points, quads)
+    bad = np.maximum(ratio / max(limit, 1.0e-9) - 1.0, 0.0)
     acc = np.zeros(n_verts)
     cnt = np.zeros(n_verts)
     for arr in quads:
@@ -409,9 +415,10 @@ def relax_quality(points, table, quads, proj, fid, iters, limit, gain, log):
         points, _d, fid = proj(points, k=16, exact=False)
         if log and (it % 10 == 0 or it == iters - 1):
             r = aspect_report(points, quads, limit)
-            log('  quality %3d/%d  aspect med %.2f p95 %.2f max %.2f  over limit %d'
-                % (it + 1, iters, r['aspect_median'], r['aspect_p95'],
-                   r['aspect_max'], r['over_limit']))
+            log('  quality %3d/%d  edge ratio med %.2f p95 %.2f max %.2f'
+                '  over limit %d'
+                % (it + 1, iters, r['ratio_median'], r['ratio_p95'],
+                   r['ratio_max'], r['over_limit']))
     return points, fid
 
 
@@ -517,9 +524,61 @@ def valence_damping(table, rings=2):
     return damp
 
 
+def edge_lengths(points, quads):
+    """The four edge lengths of every cage quad, in order a-b, b-c, c-d, d-a."""
+    a, b, c, d = quads
+    return np.stack([
+        np.linalg.norm(points[b] - points[a], axis=1),
+        np.linalg.norm(points[c] - points[b], axis=1),
+        np.linalg.norm(points[d] - points[c], axis=1),
+        np.linalg.norm(points[a] - points[d], axis=1)], axis=1)
+
+
+def edge_ratio(points, quads):
+    """Longest edge over shortest edge WITHIN each quad.
+
+    This, not the aspect of the two edge families and not the corner angle, is
+    what decides whether an element is usable: an element with one edge five
+    times another is the thing that shows as a crease and defeats a fillet. A
+    quad whose corners are not 90 degrees is fine as long as its four edges are
+    close to equal.
+    """
+    L = edge_lengths(points, quads)
+    return L.max(axis=1) / np.maximum(L.min(axis=1), 1.0e-30)
+
+
+def edge_equalise(points, quads):
+    """Spring force pulling the four edges of each quad toward a common length.
+
+    Deliberately NOT the nearest-square target that this replaced. That one also
+    rotated quads toward 90-degree corners, and the rotation is what Fusion
+    refused as ASM_TSP_IG_SURFACE_PARALLEL_SINGULARITY -- it moves the cage
+    across the surface. Equalising lengths only redistributes points along the
+    grid lines they already lie on, which is a far smaller perturbation for the
+    same benefit to element usability.
+    """
+    a, b, c, d = quads
+    L = edge_lengths(points, quads)
+    rest = L.mean(axis=1)
+    acc = np.zeros_like(points)
+    cnt = np.zeros(len(points))
+    for k, (i, j) in enumerate(((a, b), (b, c), (c, d), (d, a))):
+        e = points[j] - points[i]
+        ln = np.maximum(np.linalg.norm(e, axis=1), 1.0e-30)
+        u = e / ln[:, None]
+        # positive when this edge is longer than its quad's mean: the endpoints
+        # move toward each other, and a short edge pushes them apart
+        move = (0.5 * (ln - rest))[:, None] * u
+        np.add.at(acc, i, move)
+        np.add.at(cnt, i, 1.0)
+        np.add.at(acc, j, -move)
+        np.add.at(cnt, j, 1.0)
+    return acc / np.maximum(cnt, 1.0)[:, None]
+
+
 def relax_square(points, table, quads, proj, fid, iters, weight, min_edge,
                  limit, log, step_cap=0.10):
-    damp = valence_damping(table, rings=2)
+    damp = valence_damping(table, rings=1)
     """Drive the cage toward square elements, tangentially, with an edge floor.
 
     Tangential so the cage stays on the mesh: the whole point of the wrap is
@@ -532,7 +591,7 @@ def relax_square(points, table, quads, proj, fid, iters, weight, min_edge,
         nrm = nrm + neighbour_mean(nrm, table)
         nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-30)[:, None]
 
-        disp = weight * square_displacement(points, quads)
+        disp = weight * edge_equalise(points, quads)
         if min_edge > 0.0:
             disp = disp + min_edge_push(points, quads, min_edge)
         disp = disp * damp[:, None]
@@ -551,12 +610,10 @@ def relax_square(points, table, quads, proj, fid, iters, weight, min_edge,
         points, _d, fid = proj(points, k=16, exact=False)
         if log and (it % 20 == 0 or it == iters - 1):
             r = aspect_report(points, quads, limit)
-            _asp, _skw, eu, ev = quad_metrics(points, quads)
-            log('  square %3d/%d  aspect med %.2f p95 %.2f max %.2f  skew p95 %.2f'
-                '  shortest edge %.3f mm'
-                % (it + 1, iters, r['aspect_median'], r['aspect_p95'],
-                   r['aspect_max'], r['skew_p95'],
-                   float(min(eu.min(), ev.min())) * 10.0))
+            log('  edges %3d/%d  ratio med %.2f p95 %.2f max %.2f  over %d'
+                '  shortest %.3f mm'
+                % (it + 1, iters, r['ratio_median'], r['ratio_p95'],
+                   r['ratio_max'], r['over_limit'], r['min_edge_mm']))
     return points, fid
 
 
@@ -710,10 +767,10 @@ def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_en
     if aspect_iters > 0 and aspect_limit > 0.0:
         before = aspect_report(points, quads, aspect_limit)
         if log:
-            log('  cage quads before quality relax: aspect med %.2f p95 %.2f '
-                'max %.2f, %d of %d over %.2f'
-                % (before['aspect_median'], before['aspect_p95'],
-                   before['aspect_max'], before['over_limit'],
+            log('  cage quads before quality relax: edge ratio med %.2f '
+                'p95 %.2f max %.2f, %d of %d over %.2f'
+                % (before['ratio_median'], before['ratio_p95'],
+                   before['ratio_max'], before['over_limit'],
                    before['quads'], aspect_limit))
         points, fid = relax_quality(points, table, quads, proj, fid,
                                     int(aspect_iters), float(aspect_limit),

@@ -1141,27 +1141,24 @@ def format_report(rep, o, secs):
         q = e.get('cage_quality')
         if q and q.get('emitted'):
             em = q['emitted']
-            L.append('    quad shape      aspect med %.2f  p95 %.2f  max %.2f'
-                     '   skew p95 %.2f   (as emitted)'
-                     % (em['aspect_median'], em['aspect_p95'],
-                        em['aspect_max'], em['skew_p95']))
-            L.append('    %d of %d emitted quads exceed the aspect limit %.2f'
+            L.append('    element edges   ratio med %.2f  p95 %.2f  max %.2f'
+                     '   (longest/shortest edge within one quad)'
+                     % (em['ratio_median'], em['ratio_p95'], em['ratio_max']))
+            L.append('    %d of %d emitted elements exceed the ratio limit %.2f'
                      % (em['over_limit'], em['quads'], em['limit']))
-            if em.get('min_edge_mm') is not None:
-                L.append('    shortest element edge %.4f mm' % em['min_edge_mm'])
+            L.append('    edge length     shortest %.3f  median %.3f mm'
+                     % (em['min_edge_mm'], em['median_edge_mm']))
         if q and q.get('after'):
             aft = q['after']
             bef = q.get('before')
-            L.append('    quad shape      aspect med %.2f  p95 %.2f  max %.2f'
-                     '   skew p95 %.2f'
-                     % (aft['aspect_median'], aft['aspect_p95'],
-                        aft['aspect_max'], aft['skew_p95']))
+            L.append('    element edges   ratio med %.2f  p95 %.2f  max %.2f'
+                     % (aft['ratio_median'], aft['ratio_p95'], aft['ratio_max']))
             if bef:
                 L.append('                    was       med %.2f  p95 %.2f  max %.2f'
-                         '   skew p95 %.2f  (limit %.2f)'
-                         % (bef['aspect_median'], bef['aspect_p95'],
-                            bef['aspect_max'], bef['skew_p95'], aft['limit']))
-            L.append('    %d of %d quads still exceed the aspect limit'
+                         '   (limit %.2f)'
+                         % (bef['ratio_median'], bef['ratio_p95'],
+                            bef['ratio_max'], aft['limit']))
+            L.append('    %d of %d elements still exceed the ratio limit'
                      % (aft['over_limit'], aft['quads']))
         if e.get('signed_volume_mm3'):
             L.append('    closed volume   %.1f vs mesh %.1f mm3  (%+.3f %%)'
@@ -1240,7 +1237,7 @@ DEFAULTS = {
     'opType': 0, 'verify': True, 'hideSource': True, 'showReport': True,
     'cage': 24, 'fairness': 0.01, 'wrapIters': 50, 'relaxIters': 70,
     'ctrlRatio': 0.5, 'wrapOffset': 0.0, 'wrapClose': 0.0,
-    'aspectLimit': 3.0, 'aspectPasses': 80,
+    'aspectLimit': 1.2, 'aspectPasses': 80,
     'squarePasses': 120, 'minEdge': 0.0, 'smoothPasses': 0,
     'cageAuto': True,
     'fallbackFaceted': True,
@@ -1330,12 +1327,12 @@ def build_inputs(inputs, s):
         'ctrlRatio', 'Organic: control net / cage (NURBS only)', '',
         0.2, 1.0, 0.05, float(s['ctrlRatio']))
     c.addFloatSpinnerCommandInput(
-        'aspectLimit', 'Organic: max quad aspect (0 = off)', '',
+        'aspectLimit', 'Organic: max edge ratio in an element (0 = off)', '',
         0.0, 20.0, 0.5, float(s['aspectLimit']))
-    c.addIntegerSpinnerCommandInput('aspectPasses', 'Organic: quad shape passes',
+    c.addIntegerSpinnerCommandInput('aspectPasses', 'Organic: edge-ratio passes',
                                     0, 400, 10, int(s['aspectPasses']))
     c.addIntegerSpinnerCommandInput('squarePasses',
-                                    'Organic: squareness passes (0 = off)',
+                                    'Organic: edge equalising passes (0 = off)',
                                     0, 400, 10, int(s['squarePasses']))
     c.addValueInput('minEdge', 'Organic: min element edge (0 = off)', 'mm',
                     adsk.core.ValueInput.createByReal(float(s['minEdge']) * MM))
@@ -2018,7 +2015,7 @@ def dev_options(over):
         'faceted_cap': 20000, 'fallback_faceted': True,
         'cage': 24, 'cage_auto': False, 'fairness': 0.01, 'ctrl_ratio': 1.0,
         'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
-        'aspect_limit': 3.0, 'aspect_iters': 80, 'aspect_gain': 2.0,
+        'aspect_limit': 1.2, 'aspect_iters': 80, 'aspect_gain': 2.0,
         'square_iters': 120, 'square_weight': 0.6, 'min_edge_mm': 0.0,
         'smooth_iters': 0, 'smooth_band': 0.1,
         'wrap_iters': 50, 'relax_iters': 70,
