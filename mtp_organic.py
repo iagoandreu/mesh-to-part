@@ -970,20 +970,33 @@ def cage_quads(grids):
     return out
 
 
-def write_tsm(points, quads, scale=1.0):
-    """Serialise a quad cage as a T-Spline control mesh."""
-    # reversed: our quads are counter-clockwise from outside, TSM wants clockwise
-    quads = [(q[0], q[3], q[2], q[1]) for q in quads]
+def write_tsm(points, faces, scale=1.0):
+    """Serialise a polygon cage as a T-Spline control mesh.
+
+    Faces may have ANY arity, not just four. A half-edge structure does not care,
+    and the arity restriction was costing real quality: a quad mesher leaves a
+    handful of triangles behind, and the only way to be rid of them was to
+    midpoint-subdivide the whole mesh, which quadruples the element count and
+    lets every bad element breed four more. Letting two triangles through
+    instead keeps the good cage.
+    """
+    # reversed: our faces are counter-clockwise from outside, TSM wants clockwise
+    faces = [tuple(f)[::-1] for f in faces]
 
     edge_id = {}
-    for q in quads:
-        for k in range(4):
-            key = (q[k], q[(k + 1) % 4])
+    for q in faces:
+        n = len(q)
+        for k in range(n):
+            key = (q[k], q[(k + 1) % n])
             key = key if key[0] < key[1] else (key[1], key[0])
             if key not in edge_id:
                 edge_id[key] = len(edge_id)
 
-    n_links = 4 * len(quads)
+    start = []
+    n_links = 0
+    for q in faces:
+        start.append(n_links)
+        n_links += len(q)
     nxt = [0] * n_links
     prv = [0] * n_links
     mate = [-1] * n_links
@@ -991,14 +1004,16 @@ def write_tsm(points, quads, scale=1.0):
     fidx = [0] * n_links
     eidx = [0] * n_links
     by_edge = {}
-    for f, q in enumerate(quads):
-        for k in range(4):
-            i = 4 * f + k
-            nxt[i] = 4 * f + (k + 1) % 4
-            prv[i] = 4 * f + (k + 3) % 4
-            dest[i] = q[(k + 1) % 4]          # link runs q[k] -> q[k+1]
+    for f, q in enumerate(faces):
+        n = len(q)
+        s = start[f]
+        for k in range(n):
+            i = s + k
+            nxt[i] = s + (k + 1) % n
+            prv[i] = s + (k - 1) % n
+            dest[i] = q[(k + 1) % n]          # link runs q[k] -> q[k+1]
             fidx[i] = f
-            key = (q[k], q[(k + 1) % 4])
+            key = (q[k], q[(k + 1) % n])
             key = key if key[0] < key[1] else (key[1], key[0])
             eidx[i] = edge_id[key]
             by_edge.setdefault(edge_id[key], []).append(i)
@@ -1008,7 +1023,7 @@ def write_tsm(points, quads, scale=1.0):
                              'manifold quad mesh' % (e, len(ls)))
         mate[ls[0]], mate[ls[1]] = ls[1], ls[0]
 
-    face_link = [4 * f for f in range(len(quads))]
+    face_link = list(start)
     edge_link = [by_edge[e][0] for e in range(len(edge_id))]
     vert_link = {}
     for i in range(n_links):
@@ -1062,11 +1077,12 @@ def limit_positions(points, quads_arr, table):
 
 
 def neighbours_from_quads(n_verts, quads):
-    """Ragged neighbour table for an arbitrary quad mesh."""
+    """Ragged neighbour table for a mesh of arbitrary-arity faces."""
     nb = [set() for _ in range(n_verts)]
     for q in quads:
-        for k in range(4):
-            u, v = q[k], q[(k + 1) % 4]
+        n = len(q)
+        for k in range(n):
+            u, v = q[k], q[(k + 1) % n]
             nb[u].add(v)
             nb[v].add(u)
     width = max(len(x) for x in nb)
@@ -1180,9 +1196,18 @@ def limit_matrix(n_verts, quads_arr, table):
         cols.append(opp)
         data.append(1.0 / denom[src])
 
-    return coo_matrix((np.concatenate(data),
-                       (np.concatenate(rows), np.concatenate(cols))),
-                      shape=(n_verts, n_verts)).tocsc()
+    M = coo_matrix((np.concatenate(data),
+                    (np.concatenate(rows), np.concatenate(cols))),
+                   shape=(n_verts, n_verts)).tocsr()
+    # Row-normalise. On an all-quad cage every row already sums to 1 and this is
+    # a no-op. A cage carrying a few triangles has no opposite corner for the
+    # face term, so those rows come out short; renormalising keeps the operator
+    # affine -- constants map to constants -- which is what stops the fit
+    # translating or shrinking the whole cage.
+    from scipy.sparse import diags
+    rs = np.asarray(M.sum(axis=1)).ravel()
+    rs[rs == 0.0] = 1.0
+    return (diags(1.0 / rs) @ M).tocsc()
 
 
 def graph_laplacian(n_verts, table):
