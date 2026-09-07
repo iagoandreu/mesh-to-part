@@ -103,10 +103,19 @@ check('prismatic ladder tightens the face groups',
       len(labels(opts(method_key='prismatic'))) == 3)
 check('faceted ladder can drop the reduction',
       labels(opts(method_key='faceted'))[-1] == 'no reduction')
-check('form ladder steps DOWN, because validity binds before accuracy',
-      [r['cage'] for r in M.build_ladder(opts(method_key='form', cage=24), 30.0)]
-      == [24, 18, 13],
-      [r['cage'] for r in M.build_ladder(opts(method_key='form', cage=24), 30.0)])
+check('form ladder steps the cage DOWN when squareness is off',
+      [r['cage'] for r in M.build_ladder(
+          opts(method_key='form', cage=24, square_iters=0), 30.0)] == [24, 18, 13],
+      [r['cage'] for r in M.build_ladder(
+          opts(method_key='form', cage=24, square_iters=0), 30.0)])
+# With squareness on the ladder gains a second dimension. Shape is backed off
+# BEFORE cage size, because cage size is what carries anatomical fidelity and a
+# squareness force is the thing Fusion's T-Spline validator actually refuses.
+_sq = M.build_ladder(opts(method_key='form', cage=24, square_iters=120), 30.0)
+check('form ladder backs squareness off before it touches the cage',
+      [r['cage'] for r in _sq] == [24, 24, 24]
+      and [r['square_scale'] for r in _sq] == [1.0, 0.5, 0.25],
+      [(r['cage'], r['square_scale']) for r in _sq])
 check('no ladder is ever empty',
       all(M.build_ladder(opts(method_key=k), 30.0)
           for k in ('organic', 'prismatic', 'faceted', 'form', 'custom_organic')))

@@ -388,7 +388,24 @@ def build_ladder(o, diag_mm):
             c = max(10, int(round(start * f)))
             if c not in seen:
                 seen.append(c)
-        return [{'label': 'cage %d' % c, 'cage': c} for c in seen[:max(1, n)]]
+        # Two dimensions now, not one. A squareness force strong enough to fix
+        # slivers is often strong enough that Fusion refuses the T-Spline
+        # (ASM_TSP_IG_SURFACE_PARALLEL_SINGULARITY), and a force weak enough to
+        # be accepted changes nothing -- measured on a skin scan, 40 gentle
+        # passes left aspect max at 36.5. The validator is the only honest
+        # arbiter, so back the SHAPE off first and keep the cage size, because
+        # cage size is what carries anatomical fidelity.
+        rungs = []
+        for c in seen:
+            if int(o.get('square_iters', 0)) <= 0:
+                rungs.append({'label': 'cage %d' % c, 'cage': c,
+                              'square_scale': 0.0})
+                continue
+            for sc in (1.0, 0.5, 0.25, 0.0):
+                rungs.append({'label': 'cage %d, squareness %d%%'
+                                       % (c, int(round(sc * 100.0))),
+                              'cage': c, 'square_scale': sc})
+        return rungs[:max(1, n)]
 
     if key == 'custom_organic':
         # accuracy is set by how finely the cage samples the mesh, so that is what
@@ -650,6 +667,28 @@ def run_pipeline(app, src_body, o, progress=None):
     if o['method_key'] == 'faceted':
         apply_faceted_cap()
 
+    # 4a - optional crease smoothing, before any offset. Softening the source
+    # is the other way to stop the cage resolving noise into slivers.
+    if int(o.get('smooth_iters', 0)) > 0:
+        step('Smoothing: %d passes' % o['smooth_iters'])
+        try:
+            w0 = refetch() or work
+            sc, si = read_triangles(w0)
+            sres = run_wrap(sc, si,
+                            {'mode': 'smooth',
+                             'smooth_iters': int(o['smooth_iters']),
+                             'smooth_band': float(o.get('smooth_band', 0.1))})
+            work, work_base, work_name = add_mesh_body(
+                comp, parametric, sres['coords'], sres['idx'],
+                '%s [work smooth %s]' % (rep['source'], time.strftime('%H%M%S')))
+            if not work:
+                raise RuntimeError('Could not create the smoothed mesh body.')
+            rep['smooth'] = sres['stats']
+        except Exception:
+            rep['warnings'].append('Smoothing failed: %s'
+                                   % short_error(traceback.format_exc()))
+            log(traceback.format_exc())
+
     # 4b - optional offset ("wrap"). A level-set offset, so it cannot
     # self-intersect the way Offset Face and Shell do in a concavity.
     if abs(float(o.get('wrap_offset_mm', 0.0))) > 1.0e-9:
@@ -791,7 +830,11 @@ def run_pipeline(app, src_body, o, progress=None):
                           'fair': o['fairness'],
                           'aspect_limit': float(o.get('aspect_limit', 0.0)),
                           'aspect_iters': int(o.get('aspect_iters', 0)),
-                          'aspect_gain': float(o.get('aspect_gain', 2.0))}
+                          'aspect_gain': float(o.get('aspect_gain', 2.0)),
+                          'square_iters': int(round(o.get('square_iters', 0)
+                                                    * rung.get('square_scale', 1.0))),
+                          'square_weight': float(o.get('square_weight', 0.6)),
+                          'min_edge_mm': float(o.get('min_edge_mm', 0.0))}
                 w = refetch() or work
                 builder = (organic_form_body if o['method_key'] == 'form'
                            else organic_body)
@@ -1031,6 +1074,15 @@ def format_report(rep, o, secs):
         L.append('  face groups       %d' % rep['face_groups'])
 
     L.append('')
+    if rep.get('smooth'):
+        sm = rep['smooth']
+        L.append('')
+        L.append('SMOOTHING (Taubin, volume preserving)')
+        L.append('  passes            %d  (band %.3f)' % (sm['passes'], sm['band']))
+        L.append('  surface moved     mean %.4f   max %.4f mm'
+                 % (sm['moved_mean_mm'], sm['moved_max_mm']))
+        L.append('  volume change     %+.3f %%' % sm['volume_change_pct'])
+
     if rep.get('wrap'):
         w = rep['wrap']
         a = w['achieved']
@@ -1095,6 +1147,8 @@ def format_report(rep, o, secs):
                         em['aspect_max'], em['skew_p95']))
             L.append('    %d of %d emitted quads exceed the aspect limit %.2f'
                      % (em['over_limit'], em['quads'], em['limit']))
+            if em.get('min_edge_mm') is not None:
+                L.append('    shortest element edge %.4f mm' % em['min_edge_mm'])
         if q and q.get('after'):
             aft = q['after']
             bef = q.get('before')
@@ -1187,6 +1241,7 @@ DEFAULTS = {
     'cage': 24, 'fairness': 0.01, 'wrapIters': 50, 'relaxIters': 70,
     'ctrlRatio': 0.5, 'wrapOffset': 0.0, 'wrapClose': 0.0,
     'aspectLimit': 3.0, 'aspectPasses': 80,
+    'squarePasses': 120, 'minEdge': 0.0, 'smoothPasses': 0,
     'cageAuto': True,
     'fallbackFaceted': True,
 }
@@ -1279,6 +1334,14 @@ def build_inputs(inputs, s):
         0.0, 20.0, 0.5, float(s['aspectLimit']))
     c.addIntegerSpinnerCommandInput('aspectPasses', 'Organic: quad shape passes',
                                     0, 400, 10, int(s['aspectPasses']))
+    c.addIntegerSpinnerCommandInput('squarePasses',
+                                    'Organic: squareness passes (0 = off)',
+                                    0, 400, 10, int(s['squarePasses']))
+    c.addValueInput('minEdge', 'Organic: min element edge (0 = off)', 'mm',
+                    adsk.core.ValueInput.createByReal(float(s['minEdge']) * MM))
+    c.addIntegerSpinnerCommandInput('smoothPasses',
+                                    'Smooth creases: passes (0 = off)',
+                                    0, 200, 5, int(s['smoothPasses']))
     c.addValueInput('wrapOffset', 'Wrap: offset distance (0 = off)', 'mm',
                     adsk.core.ValueInput.createByReal(float(s['wrapOffset']) * MM))
     c.addValueInput('wrapClose', 'Wrap: close gaps up to', 'mm',
@@ -1371,7 +1434,7 @@ def refresh_visibility(inputs):
     inputs.itemById('facetedCap').isVisible = key == 'faceted'
     custom = key in ('custom_organic', 'form')
     for cid in ('cageAuto', 'fairness', 'relaxIters', 'ctrlRatio',
-                'aspectLimit', 'aspectPasses'):
+                'aspectLimit', 'aspectPasses', 'squarePasses', 'minEdge'):
         inputs.itemById(cid).isVisible = custom
     inputs.itemById('cage').isVisible = custom and not inputs.itemById('cageAuto').value
     inputs.itemById('preprocessHoles').isVisible = organic
@@ -1416,6 +1479,9 @@ def resolve_options(inputs):
         'cage_auto': inputs.itemById('cageAuto').value,
         'ctrl_ratio': inputs.itemById('ctrlRatio').value,
         'aspect_limit': inputs.itemById('aspectLimit').value,
+        'square_iters': inputs.itemById('squarePasses').value,
+        'min_edge_mm': inputs.itemById('minEdge').value * CM,
+        'smooth_iters': inputs.itemById('smoothPasses').value,
         'aspect_iters': inputs.itemById('aspectPasses').value,
         'wrap_offset_mm': inputs.itemById('wrapOffset').value * CM,
         'wrap_close_mm': inputs.itemById('wrapClose').value * CM,
@@ -1459,6 +1525,9 @@ def settings_from(inputs):
         'cageAuto': inputs.itemById('cageAuto').value,
         'ctrlRatio': inputs.itemById('ctrlRatio').value,
         'aspectLimit': inputs.itemById('aspectLimit').value,
+        'squarePasses': inputs.itemById('squarePasses').value,
+        'minEdge': inputs.itemById('minEdge').value * CM,
+        'smoothPasses': inputs.itemById('smoothPasses').value,
         'aspectPasses': inputs.itemById('aspectPasses').value,
         'wrapOffset': inputs.itemById('wrapOffset').value * CM,
         'wrapClose': inputs.itemById('wrapClose').value * CM,
@@ -1950,6 +2019,8 @@ def dev_options(over):
         'cage': 24, 'cage_auto': False, 'fairness': 0.01, 'ctrl_ratio': 1.0,
         'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
         'aspect_limit': 3.0, 'aspect_iters': 80, 'aspect_gain': 2.0,
+        'square_iters': 120, 'square_weight': 0.6, 'min_edge_mm': 0.0,
+        'smooth_iters': 0, 'smooth_band': 0.1,
         'wrap_iters': 50, 'relax_iters': 70,
         'method_key': 'prismatic', 'resolution': 'Auto from max error',
         'face_count': 5000, 'preprocess_holes': True, 'face_groups': True,

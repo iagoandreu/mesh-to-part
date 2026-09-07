@@ -336,8 +336,10 @@ def quad_metrics(points, quads):
 
 
 def aspect_report(points, quads, limit):
-    aspect, skew, _eu, _ev = quad_metrics(points, quads)
+    aspect, skew, eu, ev = quad_metrics(points, quads)
     return {
+        'min_edge_mm': float(min(eu.min(), ev.min())) * 10.0,
+        'median_edge_mm': float(np.median(np.concatenate([eu, ev]))) * 10.0,
         'aspect_median': float(np.median(aspect)),
         'aspect_p95': float(np.percentile(aspect, 95)),
         'aspect_max': float(aspect.max()),
@@ -410,6 +412,151 @@ def relax_quality(points, table, quads, proj, fid, iters, limit, gain, log):
             log('  quality %3d/%d  aspect med %.2f p95 %.2f max %.2f  over limit %d'
                 % (it + 1, iters, r['aspect_median'], r['aspect_p95'],
                    r['aspect_max'], r['over_limit']))
+    return points, fid
+
+
+def square_targets(points, quads):
+    """Where each quad's four corners would sit if the quad were a square.
+
+    The aspect-weighted Laplacian attacks unequal EDGE LENGTHS only. It left
+    skew at p95 0.94 on a real scan, because a Laplacian has no notion of a
+    corner angle: a perfectly parallelogram-shaped sliver has a small Laplacian
+    and is still a sliver. This target attacks both at once.
+
+    The square is built in the quad's own best-fit plane, at its own centroid
+    and mean corner radius, rotated to whichever of the four 90-degree
+    orientations best matches the quad as it stands (a circular mean of the
+    de-rotated corner angles). So the target is the NEAREST square, which keeps
+    the cage where it is instead of spinning it.
+    """
+    a, b, c, d = quads
+    P = (points[a], points[b], points[c], points[d])
+    g = (P[0] + P[1] + P[2] + P[3]) * 0.25
+    n = np.cross(P[2] - P[0], P[3] - P[1])
+    n = n / np.maximum(np.linalg.norm(n, axis=1), 1.0e-30)[:, None]
+    e1 = P[0] - g
+    e1 = e1 - (e1 * n).sum(axis=1)[:, None] * n
+    e1 = e1 / np.maximum(np.linalg.norm(e1, axis=1), 1.0e-30)[:, None]
+    e2 = np.cross(n, e1)
+
+    r = np.zeros(len(g))
+    cs = np.zeros(len(g))
+    sn = np.zeros(len(g))
+    for k in range(4):
+        v = P[k] - g
+        x = (v * e1).sum(axis=1)
+        y = (v * e2).sum(axis=1)
+        r += np.sqrt(x * x + y * y)
+        t = np.arctan2(y, x) - k * (np.pi * 0.5)
+        cs += np.cos(t)
+        sn += np.sin(t)
+    r *= 0.25
+    th0 = np.arctan2(sn, cs)
+
+    out = []
+    for k in range(4):
+        t = th0 + k * (np.pi * 0.5)
+        out.append(g + (r * np.cos(t))[:, None] * e1
+                   + (r * np.sin(t))[:, None] * e2)
+    return out
+
+
+def square_displacement(points, quads):
+    """Per-vertex move toward the average of its incident quads' square targets."""
+    tgt = square_targets(points, quads)
+    acc = np.zeros_like(points)
+    cnt = np.zeros(len(points))
+    for arr, t in zip(quads, tgt):
+        np.add.at(acc, arr, t)
+        np.add.at(cnt, arr, 1.0)
+    return acc / np.maximum(cnt, 1.0)[:, None] - points
+
+
+def min_edge_push(points, quads, min_edge):
+    """Separate the endpoints of any cage edge shorter than min_edge.
+
+    Squareness alone permits a quad that is square and tiny. A Form element
+    below a millimetre or so is unusable for filleting whatever its shape, so
+    the floor is enforced directly rather than hoped for.
+    """
+    a, b, c, d = quads
+    acc = np.zeros_like(points)
+    cnt = np.zeros(len(points))
+    for i, j in ((a, b), (b, c), (c, d), (d, a)):
+        e = points[j] - points[i]
+        L = np.linalg.norm(e, axis=1)
+        short = L < min_edge
+        if not short.any():
+            continue
+        u = e / np.maximum(L, 1.0e-30)[:, None]
+        push = (np.where(short, 0.5 * (min_edge - L), 0.0))[:, None] * u
+        np.add.at(acc, i, -push)
+        np.add.at(cnt, i, 1.0)
+        np.add.at(acc, j, push)
+        np.add.at(cnt, j, 1.0)
+    return acc / np.maximum(cnt, 1.0)[:, None]
+
+
+def valence_damping(table, rings=2):
+    """1 in the regular interior, 0 at the cage's extraordinary vertices.
+
+    A cube-sphere cage has 8 valence-3 corners. "Nearest square" is not defined
+    where only three quads meet, and pushing toward it there is what Fusion
+    rejects as ASM_TSP_IG_SURFACE_PARALLEL_SINGULARITY -- the T-Spline
+    validator sees degenerate, near-parallel edges at the singular point. The
+    ramp keeps the force continuous instead of switching it off at a hard
+    boundary, which would just move the problem one ring out.
+    """
+    valid = table >= 0
+    safe = np.where(valid, table, 0)
+    cnt = np.maximum(valid.sum(axis=1), 1)
+    damp = (valid.sum(axis=1) == 4).astype(float)
+    for _ in range(int(rings)):
+        nb = (damp[safe] * valid).sum(axis=1) / cnt
+        damp = np.minimum(damp, nb)
+    return damp
+
+
+def relax_square(points, table, quads, proj, fid, iters, weight, min_edge,
+                 limit, log, step_cap=0.10):
+    damp = valence_damping(table, rings=2)
+    """Drive the cage toward square elements, tangentially, with an edge floor.
+
+    Tangential so the cage stays on the mesh: the whole point of the wrap is
+    that the cage sits on the surface, and a squareness force with a normal
+    component would lift it off and the projection would drag it back to the
+    nearest convex face, undoing the concavity work.
+    """
+    for it in range(iters):
+        nrm = proj.normal[fid]
+        nrm = nrm + neighbour_mean(nrm, table)
+        nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-30)[:, None]
+
+        disp = weight * square_displacement(points, quads)
+        if min_edge > 0.0:
+            disp = disp + min_edge_push(points, quads, min_edge)
+        disp = disp * damp[:, None]
+        disp = disp - (disp * nrm).sum(axis=1)[:, None] * nrm
+
+        # A shape pass must NUDGE, not transport. At 0.35 * spacing per pass,
+        # 100 passes let a point travel far enough to slide around a toe and
+        # put the cage through itself -- Fusion then refuses the T-Spline with
+        # ASM_TSP_IG_SURFACE_PARALLEL_SINGULARITY, which the intrinsic fold test
+        # cannot see because the two crossing quads are not neighbours.
+        sp = spacing(points, table)
+        lim = step_cap * float(np.median(sp))
+        ln = np.linalg.norm(disp, axis=1)
+        disp = disp * np.minimum(1.0, lim / np.maximum(ln, 1e-30))[:, None]
+        points, _bad = safe_step_mesh(points, disp, quads, proj)
+        points, _d, fid = proj(points, k=16, exact=False)
+        if log and (it % 20 == 0 or it == iters - 1):
+            r = aspect_report(points, quads, limit)
+            _asp, _skw, eu, ev = quad_metrics(points, quads)
+            log('  square %3d/%d  aspect med %.2f p95 %.2f max %.2f  skew p95 %.2f'
+                '  shortest edge %.3f mm'
+                % (it + 1, iters, r['aspect_median'], r['aspect_p95'],
+                   r['aspect_max'], r['skew_p95'],
+                   float(min(eu.min(), ev.min())) * 10.0))
     return points, fid
 
 
@@ -491,7 +638,9 @@ def untangle(points, table, quads, proj, passes, log):
 
 def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_end,
                 sample_count, tangential_iters, untangle_passes, log,
-                aspect_limit=0.0, aspect_iters=0, aspect_gain=1.2):
+                aspect_limit=0.0, aspect_iters=0, aspect_gain=1.2,
+                square_iters=0, square_weight=0.5, min_edge=0.0,
+                square_step_cap=0.10):
     """Pull the cage onto the mesh, then let it slide along the surface.
 
     Phase 1 - free wrap. A KD-tree over a dense surface sample drives it, which is
@@ -572,15 +721,27 @@ def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_en
         quality = {'before': before,
                    'after': aspect_report(points, quads, aspect_limit)}
 
+    if square_iters > 0:
+        lim_for_report = aspect_limit if aspect_limit > 0 else 3.0
+        if quality is None:
+            quality = {'before': aspect_report(points, quads, lim_for_report)}
+        points, fid = relax_square(points, table, quads, proj, fid,
+                                   int(square_iters), float(square_weight),
+                                   float(min_edge), lim_for_report, log,
+                                   step_cap=float(square_step_cap))
+
     points, n_folded = untangle(points, table, quads, proj,
                                 int(untangle_passes), log)
     points, _d, _f = proj(points)          # exact landing
+    rep_limit = aspect_limit if aspect_limit > 0.0 else 3.0
     if quality is not None:
         # untangle moves points too, so the number that gets reported is the one
         # measured on the cage that is actually used
-        quality['after'] = aspect_report(points, quads, aspect_limit)
+        quality['after'] = aspect_report(points, quads, rep_limit)
+        _a, _s, eu, ev = quad_metrics(points, quads)
+        quality['after']['min_edge_mm'] = float(min(eu.min(), ev.min())) * 10.0
     elif aspect_limit > 0.0:
-        quality = {'after': aspect_report(points, quads, aspect_limit)}
+        quality = {'after': aspect_report(points, quads, rep_limit)}
     return points, n_folded, quality
 
 
@@ -1107,7 +1268,11 @@ def build(job, log):
         log=log,
         aspect_limit=float(job.get('aspect_limit', 0.0)),
         aspect_iters=int(job.get('aspect_iters', 0)),
-        aspect_gain=float(job.get('aspect_gain', 1.2)))
+        aspect_gain=float(job.get('aspect_gain', 1.2)),
+        square_iters=int(job.get('square_iters', 0)),
+        square_weight=float(job.get('square_weight', 0.5)),
+        min_edge=float(job.get('min_edge_mm', 0.0)) * 0.1,
+        square_step_cap=float(job.get('square_step_cap', 0.10)))
     _c, dcage, _f = proj(points)
     log('cage sits on the mesh to %.5f mm' % (dcage.max() * 10.0))
 

@@ -208,6 +208,61 @@ def achieved(iso, mesh, sample=4000):
     }
 
 
+def smooth_only(job):
+    """Soften a mesh in place: Taubin smoothing, no offset, no resampling.
+
+    Separate from the offset path on purpose. The offset goes through a voxel
+    grid, so it resamples and quantises; when all you want is to take the edge
+    off creases before fitting, that resampling is a cost with no benefit.
+    Taubin rather than Laplacian because a Laplacian smooth of a closed surface
+    shrinks it, and shrinking a patient-specific surface is not a cosmetic
+    change.
+    """
+    import trimesh
+
+    t0 = time.time()
+    coords = np.asarray(job['coords'], dtype=float).reshape(-1, 3) * CM
+    idx = np.asarray(job['idx'], dtype=np.int64).reshape(-1, 3)
+    n_iter = int(job.get('smooth_iters', 20))
+    band = float(job.get('smooth_band', 0.1))
+
+    mesh = trimesh.Trimesh(vertices=coords, faces=idx, process=True)
+    before_vol = float(mesh.volume)
+    surf = as_polydata(mesh)
+    out_pd = surf.smooth_taubin(n_iter=n_iter, pass_band=band,
+                                normalize_coordinates=True)
+    faces = np.asarray(out_pd.faces).reshape(-1, 4)[:, 1:]
+    out = trimesh.Trimesh(vertices=np.asarray(out_pd.points, float),
+                          faces=faces, process=True)
+    if not out.is_watertight:
+        out.fill_holes()
+    out.fix_normals()
+
+    moved = exact_signed_distance(np.asarray(out.vertices, float), mesh)
+    log('smooth: %d passes, band %.3f, moved mean %.4f max %.4f mm'
+        % (n_iter, band, float(np.abs(moved).mean()), float(np.abs(moved).max())))
+
+    return {
+        'ok': True,
+        'coords': (out.vertices * MM).ravel().tolist(),
+        'idx': out.faces.ravel().astype(int).tolist(),
+        'stats': {
+            'mode': 'smooth',
+            'passes': n_iter,
+            'band': band,
+            'moved_mean_mm': float(np.abs(moved).mean()),
+            'moved_max_mm': float(np.abs(moved).max()),
+            'volume_before_mm3': before_vol,
+            'volume_after_mm3': float(out.volume),
+            'volume_change_pct': 100.0 * (float(out.volume) - before_vol)
+                                 / max(before_vol, 1e-30),
+            'watertight': bool(out.is_watertight),
+            'secs': round(time.time() - t0, 2),
+        },
+        'log': list(_LOG),
+    }
+
+
 def run(job):
     import trimesh
 
@@ -290,7 +345,7 @@ def main():
     with open(jp, encoding='utf-8') as fh:
         job = json.load(fh)
     try:
-        res = run(job)
+        res = smooth_only(job) if job.get('mode') == 'smooth' else run(job)
     except Exception:
         import traceback
         res = {'ok': False, 'error': traceback.format_exc(), 'log': list(_LOG)}
