@@ -73,6 +73,7 @@ REPAIR_MODES = [
 METHODS = [
     ('form', 'Organic Form (T-Spline, built-in)', None),
     ('custom_organic', 'Organic NURBS (built-in)', None),
+    ('quad_cage', 'Organic Form (quad cage, size-driven)', None),
     ('prismatic', 'Prismatic (planes, cylinders, cones)',
      adsk.fusion.MeshConvertMethodTypes.PrismaticMeshConvertMethodType),
     ('organic', 'Organic (Form / T-Spline)',
@@ -85,6 +86,27 @@ METHOD_BY_KEY = {k: (lab, en) for k, lab, en in METHODS}
 RESOLUTIONS = ['Auto from max error', 'Low', 'Medium', 'High', 'Precise', 'By face count']
 
 
+_GMSH_OK = None
+
+
+def has_gmsh():
+    """Is gmsh importable in the engine's interpreter? Cached; one subprocess."""
+    global _GMSH_OK
+    if _GMSH_OK is None:
+        import subprocess
+        exe = python_cmd()
+        if not exe:
+            _GMSH_OK = False
+        else:
+            try:
+                r = subprocess.run(exe + ['-c', 'import gmsh'], capture_output=True,
+                                   timeout=90, creationflags=NO_WINDOW)
+                _GMSH_OK = (r.returncode == 0)
+            except Exception:
+                _GMSH_OK = False
+    return _GMSH_OK
+
+
 def probe_methods(comp, mesh_body):
     """Which conversion methods this licence actually allows.
 
@@ -95,9 +117,11 @@ def probe_methods(comp, mesh_body):
     for key, label, enum in METHODS:
         if enum is None:                 # ours; nothing to ask the licence about
             ok = bool(python_cmd()) and os.path.exists(ORGANIC_ENGINE)
-            out[key] = (ok, '' if ok else
-                        'needs a Python with numpy, scipy and trimesh; see '
-                        'python_path.txt')
+            why = ('' if ok else 'needs a Python with numpy, scipy and trimesh; '
+                                 'see python_path.txt')
+            if ok and key == 'quad_cage' and not has_gmsh():
+                ok, why = False, 'needs gmsh in that Python: pip install gmsh'
+            out[key] = (ok, why)
             continue
         try:
             ci = comp.features.meshConvertFeatures.createInput([mesh_body])
@@ -407,6 +431,16 @@ def build_ladder(o, diag_mm):
                               'cage': c, 'square_scale': sc})
         return rungs[:max(1, n)]
 
+    if key == 'quad_cage':
+        # size is the input here, so the ladder refines size. Each rung is a
+        # smaller target element, which is the honest way to spend more error
+        # budget -- there is no cage count to climb.
+        h = float(o.get('quad_size_mm', 8.0))
+        for k in range(n):
+            rungs.append({'label': 'element %.2f mm' % (h * (0.7 ** k)),
+                          'hmax': h * (0.7 ** k)})
+        return rungs
+
     if key == 'custom_organic':
         # accuracy is set by how finely the cage samples the mesh, so that is what
         # the ladder climbs
@@ -502,7 +536,7 @@ def run_pipeline(app, src_body, o, progress=None):
 
     # what this licence actually allows, before anything is built
     o = dict(o)
-    if o['method_key'] == 'form' and not parametric:
+    if o['method_key'] in ('form', 'quad_cage') and not parametric:
         raise RuntimeError(
             'A Form (T-Spline) body needs a parametric design, and this one has '
             'design history captured off. Turn it on (right-click the document '
@@ -814,7 +848,17 @@ def run_pipeline(app, src_body, o, progress=None):
 
         step('Converting: %s (%s)' % (o['method_label'].split(' (')[0], label))
         try:
-            if o['method_key'] in ('custom_organic', 'form'):
+            if o['method_key'] == 'quad_cage':
+                params = {'cage_source': 'gmsh',
+                          'hmax_mm': float(rung['hmax']),
+                          'hmin_mm': float(o.get('min_edge_mm', 0.0)) or 1.0,
+                          'curvature': float(o.get('curvature', 16.0)),
+                          'aspect_limit': float(o.get('aspect_limit', 0.0)) or 1.2,
+                          'cage_input_tris': int(o.get('cage_input_tris', 20000))}
+                w = refetch() or work
+                body, eres, feat = organic_form_body(app, w, params, org_log)
+                rep['engine'] = eres['stats']
+            elif o['method_key'] in ('custom_organic', 'form'):
                 # ctrl < cage+1 makes this a least-squares FIT; ctrl == cage+1
                 # makes it an interpolation of every cage point. The cage sits
                 # exactly on the mesh, so interpolating it reproduces the
@@ -1238,7 +1282,8 @@ DEFAULTS = {
     'cage': 24, 'fairness': 0.01, 'wrapIters': 50, 'relaxIters': 70,
     'ctrlRatio': 0.5, 'wrapOffset': 0.0, 'wrapClose': 0.0,
     'aspectLimit': 1.2, 'aspectPasses': 80,
-    'squarePasses': 120, 'minEdge': 0.0, 'smoothPasses': 0,
+    'squarePasses': 120, 'minEdge': 1.5, 'smoothPasses': 0,
+    'quadSize': 8.0, 'quadCurv': 16,
     'cageAuto': True,
     'fallbackFaceted': True,
 }
@@ -1326,6 +1371,11 @@ def build_inputs(inputs, s):
     c.addFloatSpinnerCommandInput(
         'ctrlRatio', 'Organic: control net / cage (NURBS only)', '',
         0.2, 1.0, 0.05, float(s['ctrlRatio']))
+    c.addValueInput('quadSize', 'Quad cage: target element size', 'mm',
+                    adsk.core.ValueInput.createByReal(float(s['quadSize']) * MM))
+    c.addIntegerSpinnerCommandInput('quadCurv',
+                                    'Quad cage: elements per curvature circle',
+                                    0, 60, 2, int(s['quadCurv']))
     c.addFloatSpinnerCommandInput(
         'aspectLimit', 'Organic: max edge ratio in an element (0 = off)', '',
         0.0, 20.0, 0.5, float(s['aspectLimit']))
@@ -1433,6 +1483,16 @@ def refresh_visibility(inputs):
     for cid in ('cageAuto', 'fairness', 'relaxIters', 'ctrlRatio',
                 'aspectLimit', 'aspectPasses', 'squarePasses', 'minEdge'):
         inputs.itemById(cid).isVisible = custom
+    quadc = (key == 'quad_cage')
+    for cid in ('quadSize', 'quadCurv'):
+        inputs.itemById(cid).isVisible = quadc
+    if quadc:
+        # the cube-sphere controls mean nothing to a size-driven cage
+        for cid in ('cageAuto', 'cage', 'fairness', 'relaxIters', 'ctrlRatio',
+                    'aspectPasses', 'squarePasses'):
+            inputs.itemById(cid).isVisible = False
+        for cid in ('minEdge', 'aspectLimit'):
+            inputs.itemById(cid).isVisible = True
     inputs.itemById('cage').isVisible = custom and not inputs.itemById('cageAuto').value
     inputs.itemById('preprocessHoles').isVisible = organic
     inputs.itemById('escalate').isVisible = not by_count
@@ -1477,6 +1537,8 @@ def resolve_options(inputs):
         'ctrl_ratio': inputs.itemById('ctrlRatio').value,
         'aspect_limit': inputs.itemById('aspectLimit').value,
         'square_iters': inputs.itemById('squarePasses').value,
+        'quad_size_mm': inputs.itemById('quadSize').value * CM,
+        'curvature': inputs.itemById('quadCurv').value,
         'min_edge_mm': inputs.itemById('minEdge').value * CM,
         'smooth_iters': inputs.itemById('smoothPasses').value,
         'aspect_iters': inputs.itemById('aspectPasses').value,
@@ -1523,6 +1585,8 @@ def settings_from(inputs):
         'ctrlRatio': inputs.itemById('ctrlRatio').value,
         'aspectLimit': inputs.itemById('aspectLimit').value,
         'squarePasses': inputs.itemById('squarePasses').value,
+        'quadSize': inputs.itemById('quadSize').value * CM,
+        'quadCurv': inputs.itemById('quadCurv').value,
         'minEdge': inputs.itemById('minEdge').value * CM,
         'smoothPasses': inputs.itemById('smoothPasses').value,
         'aspectPasses': inputs.itemById('aspectPasses').value,
@@ -2016,6 +2080,7 @@ def dev_options(over):
         'cage': 24, 'cage_auto': False, 'fairness': 0.01, 'ctrl_ratio': 1.0,
         'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
         'aspect_limit': 1.2, 'aspect_iters': 80, 'aspect_gain': 2.0,
+        'quad_size_mm': 8.0, 'curvature': 16.0, 'cage_input_tris': 20000,
         'square_iters': 120, 'square_weight': 0.6, 'min_edge_mm': 0.0,
         'smooth_iters': 0, 'smooth_band': 0.1,
         'wrap_iters': 50, 'relax_iters': 70,
@@ -2288,12 +2353,20 @@ def dev_tsm_try(app, job):
     out = {}
     for name, text in (job.get('cases') or {}).items():
         ff = None
+        finished = False
         try:
             ff = comp.features.formFeatures.add()
             ff.startEdit()
             b = ff.tSplineBodies.addByTSMDescription(text)
-            out[name] = {'ok': True, 'body': b.name if b else None,
-                         'count': ff.tSplineBodies.count}
+            name_now = b.name if b else None
+            count_now = ff.tSplineBodies.count
+            # finishEdit, INSIDE the try. The parser accepting a cage and the
+            # modeller accepting the body it implies are different questions:
+            # ASM_IG_SURFACE_SELF_INTERSECTS is only raised here. Reporting ok
+            # before this point called a self-intersecting body a success.
+            ff.finishEdit()
+            finished = True
+            out[name] = {'ok': True, 'body': name_now, 'count': count_now}
             try:
                 out[name]['roundtrip'] = b.getTSMDescription()[:2000] if b else None
             except Exception:
@@ -2302,13 +2375,16 @@ def dev_tsm_try(app, job):
             out[name] = {'ok': False, 'why': short_error(traceback.format_exc())}
         finally:
             try:
-                if ff:
+                if ff and not finished:
                     ff.finishEdit()
-                    # keep=true leaves the body in the document, which is the
-                    # difference between proving the parser accepts a cage and
-                    # being able to look at the thing in the Form environment
-                    if not job.get('keep'):
-                        ff.deleteMe()
+            except Exception:
+                log(traceback.format_exc())
+            try:
+                # keep=true leaves the body in the document, which is the
+                # difference between proving the modeller accepts a cage and
+                # being able to look at the thing in the Form environment
+                if ff and not job.get('keep'):
+                    ff.deleteMe()
             except Exception:
                 log(traceback.format_exc())
     return out

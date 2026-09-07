@@ -1320,6 +1320,219 @@ def fit_limit_unfolded(points, quads_arr, table, proj, iters, lam0, passes,
     return best
 
 
+def orient_faces(faces):
+    """Make every face wind the same way round the surface.
+
+    gmsh orients each classified patch independently, so a cage assembled from
+    several patches can have neighbours wound opposite ways. Signed volume then
+    means nothing -- measured -46% against the source on a cage that was
+    geometrically fine -- and the half-edge mates come out inconsistent, which
+    is exactly what a T-Spline reads as a self-intersecting surface.
+
+    BFS the face-adjacency graph and flip any neighbour that traverses a shared
+    edge in the SAME direction as the face it came from; two correctly oriented
+    faces always traverse their shared edge in opposite directions.
+    """
+    half = {}
+    for fi, f in enumerate(faces):
+        n = len(f)
+        for k in range(n):
+            half.setdefault((f[k], f[(k + 1) % n]), []).append(fi)
+    adj = {}
+    for (a, b), fs in half.items():
+        for fi in fs:
+            lst = adj.setdefault(fi, [])
+            for fj in half.get((b, a), ()):
+                lst.append((fj, False))       # opposite traversal: consistent
+            for fj in fs:
+                if fj != fi:
+                    lst.append((fj, True))    # same traversal: must flip
+    seen = [False] * len(faces)
+    flip = [False] * len(faces)
+    for root in range(len(faces)):
+        if seen[root]:
+            continue
+        seen[root] = True
+        stack = [root]
+        while stack:
+            fi = stack.pop()
+            for fj, must in adj.get(fi, ()):
+                if not seen[fj]:
+                    seen[fj] = True
+                    flip[fj] = flip[fi] ^ must
+                    stack.append(fj)
+    return [tuple(f)[::-1] if flip[i] else tuple(f) for i, f in enumerate(faces)]
+
+
+def collapse_short_edges(pts, faces, floor, log):
+    """Enforce a minimum element edge by welding the ends of shorter edges.
+
+    gmsh's MeshSizeMin governs the point INSERTION field, not what recombination
+    then does with the triangles, so the floor is routinely violated: asking for
+    1.5 mm produced a 0.30 mm shortest edge. Rather than hope, merge the ends of
+    any edge below the floor.
+
+    Union-find over the short edges only, so a chain of them collapses to one
+    point instead of leaving a shorter edge behind. A face that loses a corner
+    becomes a triangle, which write_tsm now accepts, and a face that collapses
+    below three distinct corners is dropped. If the result stops being a closed
+    manifold the collapse is abandoned -- a floor is not worth a broken cage.
+    """
+    if floor <= 0.0:
+        return pts, faces
+    parent = list(range(len(pts)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    short = 0
+    for f in faces:
+        n = len(f)
+        for k in range(n):
+            a, b = f[k], f[(k + 1) % n]
+            if np.linalg.norm(pts[a] - pts[b]) < floor:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+                    short += 1
+    if not short:
+        return pts, faces
+
+    groups = {}
+    for i in range(len(pts)):
+        groups.setdefault(find(i), []).append(i)
+    order = sorted(groups)
+    new_id = {root: i for i, root in enumerate(order)}
+    new_pts = np.array([pts[groups[r]].mean(axis=0) for r in order])
+
+    new_faces = []
+    for f in faces:
+        seq = [new_id[find(v)] for v in f]
+        ded = [v for i, v in enumerate(seq) if v != seq[i - 1]]     # cyclic dedup
+        if len(ded) >= 3 and len(set(ded)) == len(ded):
+            new_faces.append(tuple(ded))
+
+    counts = {}
+    for f in new_faces:
+        n = len(f)
+        for k in range(n):
+            a, b = f[k], f[(k + 1) % n]
+            key = (a, b) if a < b else (b, a)
+            counts[key] = counts.get(key, 0) + 1
+    if any(c != 2 for c in counts.values()) or len(new_faces) < 4:
+        log('  edge floor %.2f mm abandoned: the collapse broke the manifold'
+            % (floor * 10.0))
+        return pts, faces
+    used = {v for f in new_faces for v in f}
+    if len(used) != len(new_pts):
+        remap = {v: i for i, v in enumerate(sorted(used))}
+        new_pts = new_pts[sorted(used)]
+        new_faces = [tuple(remap[v] for v in f) for f in new_faces]
+    log('  edge floor %.2f mm: %d short edges collapsed, %d -> %d vertices, '
+        '%d -> %d faces'
+        % (floor * 10.0, short, len(pts), len(new_pts), len(faces), len(new_faces)))
+    return new_pts, new_faces
+
+
+def gmsh_cage(mesh, job, log):
+    """A quad cage from gmsh, already sitting on the mesh. Points in CENTIMETRES.
+
+    This replaces cube_sphere for the quad-cage method. The difference that
+    matters is not the mesher but the inversion: element SIZE is the input here
+    and the element count follows, where a cube-sphere fixes the count first and
+    lets size fall out wherever the surface happens to need area. That is why a
+    fixed grid cannot hold an edge-length ratio on anatomy and this can.
+    """
+    import os
+    import tempfile
+    import gmsh
+    import pyvista as pv
+
+    hmax = float(job.get('hmax_mm', 8.0))
+    hmin = float(job.get('hmin_mm', 1.5))
+    curv = float(job.get('curvature', 16.0))
+    budget = int(job.get('cage_input_tris', 20000))
+
+    v_mm = np.asarray(mesh.vertices, float) * 10.0
+    f = np.asarray(mesh.faces)
+    if len(f) > budget:
+        pd = pv.PolyData(v_mm, np.hstack([np.full((len(f), 1), 3), f]).ravel())
+        sm = pd.decimate(1.0 - float(budget) / len(f)).clean().triangulate()
+        v_in = np.asarray(sm.points, float)
+        f_in = np.asarray(sm.faces).reshape(-1, 4)[:, 1:]
+        log('  cage input decimated %d -> %d triangles' % (len(f), len(f_in)))
+    else:
+        v_in, f_in = v_mm, f
+
+    tmp = os.path.join(tempfile.gettempdir(), 'mtp_cage_%d.stl' % os.getpid())
+    trimesh.Trimesh(vertices=v_in, faces=f_in, process=True).export(tmp)
+    try:
+        gmsh.initialize()
+        gmsh.option.setNumber('General.Terminal', 0)
+        gmsh.merge(tmp)
+        # pi, not a feature angle: on a noisy scan a 60 degree angle shatters
+        # the surface into thousands of patches and classifySurfaces never
+        # returns. At pi it is instant and the reparametrisation still splits
+        # wherever it has to.
+        gmsh.model.mesh.classifySurfaces(math.pi, True, True, math.pi)
+        gmsh.model.mesh.createGeometry()
+        gmsh.model.geo.synchronize()
+        for k, val in (('Mesh.MeshSizeMin', hmin), ('Mesh.MeshSizeMax', hmax),
+                       ('Mesh.MeshSizeFromCurvature', curv),
+                       ('Mesh.MeshSizeExtendFromBoundary', 0),
+                       ('Mesh.Algorithm', 8), ('Mesh.RecombineAll', 1),
+                       ('Mesh.RecombinationAlgorithm', 3),
+                       ('Mesh.SubdivisionAlgorithm', 0)):
+            gmsh.option.setNumber(k, val)
+        gmsh.model.mesh.generate(2)
+        tags, coords, _p = gmsh.model.mesh.getNodes()
+        pts = np.asarray(coords, float).reshape(-1, 3)
+        remap = {int(t): i for i, t in enumerate(tags)}
+        etypes, _eids, enodes = gmsh.model.mesh.getElements(2)
+        faces = []
+        for t, nodes in zip(etypes, enodes):
+            arity = {2: 3, 3: 4}.get(int(t))
+            if not arity:
+                continue
+            arr = np.array([remap[int(x)] for x in nodes], np.int64).reshape(-1, arity)
+            faces.extend(tuple(int(x) for x in row) for row in arr)
+    finally:
+        try:
+            gmsh.finalize()
+        except Exception:
+            pass
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    if not faces:
+        raise RuntimeError('gmsh produced no surface elements for the cage')
+
+    used = sorted({v for fc in faces for v in fc})
+    idx = {v: i for i, v in enumerate(used)}
+    pts = pts[used]
+    faces = [tuple(idx[v] for v in fc) for fc in faces]
+    faces = orient_faces(faces)
+    pts, faces = collapse_short_edges(pts, faces, hmin * float(job.get('edge_floor', 0.6)), log)
+
+    tri = []
+    for fc in faces:
+        tri.append((fc[0], fc[1], fc[2]))
+        if len(fc) == 4:
+            tri.append((fc[0], fc[2], fc[3]))
+    if trimesh.Trimesh(vertices=pts, faces=np.array(tri), process=False).volume < 0:
+        faces = [tuple(reversed(fc)) for fc in faces]
+
+    nq = sum(1 for fc in faces if len(fc) == 4)
+    log('  gmsh cage: %d quads + %d triangles, %d vertices (size %.1f-%.1f mm, '
+        'curvature %d)' % (nq, len(faces) - nq, len(pts), hmin, hmax, int(curv)))
+    return pts * 0.1, faces          # mm -> cm
+
+
 def build(job, log):
     t0 = time.time()
     coords = np.array(job['coords'], float).reshape(-1, 3)
@@ -1330,38 +1543,60 @@ def build(job, log):
 
     n = int(job.get('cage', 24))
     m = n + 1
-    verts, grids = cube_sphere(n)
-    table = cage_neighbours(len(verts), grids)
+    cage_faces = None
+    grids = None
 
-    centre = mesh.bounding_box.centroid
-    radius = float(np.linalg.norm(mesh.vertices - centre, axis=1).max()) * 1.05
-    points = verts * radius + centre
-    log('cage %d verts, start sphere r=%.2f mm' % (len(points), radius * 10.0))
+    if job.get('cage_source') == 'gmsh':
+        if job.get('output') != 'tsm':
+            raise RuntimeError('the quad cage is a Form (T-Spline) cage; '
+                               'the NURBS path needs the cube-sphere')
+        points, cage_faces = gmsh_cage(mesh, job, log)
+        proj = Projector(mesh)
+        table = neighbours_from_quads(len(points), cage_faces)
+        qs = np.array([f for f in cage_faces if len(f) == 4], np.int64)
+        qa = (qs[:, 0].copy(), qs[:, 1].copy(), qs[:, 2].copy(), qs[:, 3].copy())
+        quads = [list(f) for f in cage_faces if len(f) == 4]
+        cage_folds = 0
+        # no shrink wrap and no relaxation: the cage is generated ON the
+        # mesh at a prescribed element size, which is the point of using
+        # a mesher instead of deforming a sphere onto the surface
+        cage_quality = {'after': aspect_report(
+            points, qa, float(job.get('aspect_limit', 1.2)) or 1.2)}
+    else:
+        verts, grids = cube_sphere(n)
+        table = cage_neighbours(len(verts), grids)
 
-    proj = Projector(mesh)
-    points, cage_folds, cage_quality = shrink_wrap(
-        mesh, proj, points, table, grids,
-        iters=int(job.get('wrap_iters', 50)),
-        smooth_start=float(job.get('smooth_start', 0.55)),
-        smooth_end=float(job.get('smooth_end', 0.06)),
-        sample_count=int(job.get('samples', 120000)),
-        tangential_iters=int(job.get('relax_iters', 60)),
-        untangle_passes=int(job.get('untangle', 12)),
-        log=log,
-        aspect_limit=float(job.get('aspect_limit', 0.0)),
-        aspect_iters=int(job.get('aspect_iters', 0)),
-        aspect_gain=float(job.get('aspect_gain', 1.2)),
-        square_iters=int(job.get('square_iters', 0)),
-        square_weight=float(job.get('square_weight', 0.5)),
-        min_edge=float(job.get('min_edge_mm', 0.0)) * 0.1,
-        square_step_cap=float(job.get('square_step_cap', 0.10)))
+        centre = mesh.bounding_box.centroid
+        radius = float(np.linalg.norm(mesh.vertices - centre, axis=1).max()) * 1.05
+        points = verts * radius + centre
+        log('cage %d verts, start sphere r=%.2f mm' % (len(points), radius * 10.0))
+
+        proj = Projector(mesh)
+        points, cage_folds, cage_quality = shrink_wrap(
+            mesh, proj, points, table, grids,
+            iters=int(job.get('wrap_iters', 50)),
+            smooth_start=float(job.get('smooth_start', 0.55)),
+            smooth_end=float(job.get('smooth_end', 0.06)),
+            sample_count=int(job.get('samples', 120000)),
+            tangential_iters=int(job.get('relax_iters', 60)),
+            untangle_passes=int(job.get('untangle', 12)),
+            log=log,
+            aspect_limit=float(job.get('aspect_limit', 0.0)),
+            aspect_iters=int(job.get('aspect_iters', 0)),
+            aspect_gain=float(job.get('aspect_gain', 1.2)),
+            square_iters=int(job.get('square_iters', 0)),
+            square_weight=float(job.get('square_weight', 0.5)),
+            min_edge=float(job.get('min_edge_mm', 0.0)) * 0.1,
+            square_step_cap=float(job.get('square_step_cap', 0.10)))
+
     _c, dcage, _f = proj(points)
     log('cage sits on the mesh to %.5f mm' % (dcage.max() * 10.0))
 
     # ---- Form / T-Spline output -------------------------------------------- #
     if job.get('output') == 'tsm':
-        quads = cage_quads(grids)
-        qa = quad_arrays(grids)
+        if grids is not None:
+            quads = cage_quads(grids)
+            qa = quad_arrays(grids)
         pts, lim_max, lim_mean, lim_folds, lam_used = fit_limit_unfolded(
             points, qa, table, proj, int(job.get('limit_iters', 20)),
             float(job.get('limit_fair', 1.0e-3)),
@@ -1380,7 +1615,7 @@ def build(job, log):
 
 
         return {
-            'tsm': write_tsm(pts, quads),
+            'tsm': write_tsm(pts, cage_faces if cage_faces is not None else quads),
             'cage_points': pts.tolist(),
             'stats': {
                 'output': 'tsm',
