@@ -740,10 +740,18 @@ def run_pipeline(app, src_body, o, progress=None):
         step('Converting: %s (%s)' % (o['method_label'].split(' (')[0], label))
         try:
             if o['method_key'] in ('custom_organic', 'form'):
+                # ctrl < cage+1 makes this a least-squares FIT; ctrl == cage+1
+                # makes it an interpolation of every cage point. The cage sits
+                # exactly on the mesh, so interpolating it reproduces the
+                # mesh's own faceting as curvature ripple -- visible as pinch
+                # lines / stripes under specular shading. Sampling densely
+                # (cage) and fitting loosely (ctrl) is what removes them.
+                m = rung['cage'] + 1
+                ctrl = max(6, min(m, int(round(o.get('ctrl_ratio', 1.0) * m))))
                 params = {'cage': rung['cage'],
                           'wrap_iters': o['wrap_iters'],
                           'relax_iters': o['relax_iters'],
-                          'ctrl': rung['cage'] + 1,
+                          'ctrl': ctrl,
                           'fair': o['fairness']}
                 w = refetch() or work
                 builder = (organic_form_body if o['method_key'] == 'form'
@@ -1095,6 +1103,7 @@ DEFAULTS = {
     'preprocessHoles': True, 'faceGroups': True, 'featureAngle': 25.0, 'minGroup': 0.02,
     'opType': 0, 'verify': True, 'hideSource': True, 'showReport': True,
     'cage': 24, 'fairness': 0.01, 'wrapIters': 50, 'relaxIters': 70,
+    'ctrlRatio': 0.5,
     'cageAuto': True,
     'fallbackFaceted': True,
 }
@@ -1177,6 +1186,9 @@ def build_inputs(inputs, s):
                         True, '', s['cageAuto'])
     c.addIntegerSpinnerCommandInput('cage', 'Organic: cage per face', 8, 72, 4,
                                     int(s['cage']))
+    c.addFloatSpinnerCommandInput(
+        'ctrlRatio', 'Organic: control net / cage (NURBS only)', '',
+        0.2, 1.0, 0.05, float(s['ctrlRatio']))
     c.addFloatSpinnerCommandInput('fairness', 'Organic: fairness (NURBS only)', '',
                                   0.0, 1.0, 0.005, float(s['fairness']))
     c.addIntegerSpinnerCommandInput('relaxIters', 'Organic: relax passes',
@@ -1264,7 +1276,7 @@ def refresh_visibility(inputs):
     inputs.itemById('faceCount').isVisible = by_count
     inputs.itemById('facetedCap').isVisible = key == 'faceted'
     custom = key in ('custom_organic', 'form')
-    for cid in ('cageAuto', 'fairness', 'relaxIters'):
+    for cid in ('cageAuto', 'fairness', 'relaxIters', 'ctrlRatio'):
         inputs.itemById(cid).isVisible = custom
     inputs.itemById('cage').isVisible = custom and not inputs.itemById('cageAuto').value
     inputs.itemById('preprocessHoles').isVisible = organic
@@ -1307,6 +1319,7 @@ def resolve_options(inputs):
         'faceted_cap': inputs.itemById('facetedCap').value,
         'cage': inputs.itemById('cage').value,
         'cage_auto': inputs.itemById('cageAuto').value,
+        'ctrl_ratio': inputs.itemById('ctrlRatio').value,
         'fairness': inputs.itemById('fairness').value,
         'wrap_iters': 50,
         'relax_iters': inputs.itemById('relaxIters').value,
@@ -1345,6 +1358,7 @@ def settings_from(inputs):
         'facetedCap': inputs.itemById('facetedCap').value,
         'cage': inputs.itemById('cage').value,
         'cageAuto': inputs.itemById('cageAuto').value,
+        'ctrlRatio': inputs.itemById('ctrlRatio').value,
         'fairness': inputs.itemById('fairness').value,
         'relaxIters': inputs.itemById('relaxIters').value,
         'fallbackFaceted': inputs.itemById('fallbackFaceted').value,
@@ -1436,13 +1450,27 @@ def deep_info(sel_input):
 
 
 def collect_mesh_bodies(comp, out):
+    """Every mesh body in the assembly, at ANY depth.
+
+    The previous version walked only `comp.occurrences`, which is the direct
+    children. A mesh sitting two components down -- what an imported STL
+    assembly usually looks like -- was invisible, and the add-in reported
+    "no mesh body in the active document" with the mesh plainly on screen.
+    `allOccurrences` is flat over the whole tree and each item already
+    carries its own assembly context.
+    """
     for i in range(comp.meshBodies.count):
         out.append(comp.meshBodies.item(i))
-    for i in range(comp.occurrences.count):
-        occ = comp.occurrences.item(i)
+    try:
+        occs = comp.allOccurrences
+    except Exception:
+        return
+    for i in range(occs.count):
+        occ = occs.item(i)
         try:
-            for j in range(occ.component.meshBodies.count):
-                out.append(occ.component.meshBodies.item(j).createForAssemblyContext(occ))
+            bodies = occ.component.meshBodies
+            for j in range(bodies.count):
+                out.append(bodies.item(j).createForAssemblyContext(occ))
         except Exception:
             pass
 
@@ -1772,7 +1800,7 @@ def dev_options(over):
         'repair_type': None, 'repair_label': 'None', 'rebuild_density': 128,
         'reduce': True, 'reduce_over': 150000, 'reduce_share': 0.4,
         'faceted_cap': 20000, 'fallback_faceted': True,
-        'cage': 24, 'cage_auto': False, 'fairness': 0.01,
+        'cage': 24, 'cage_auto': False, 'fairness': 0.01, 'ctrl_ratio': 1.0,
         'wrap_iters': 50, 'relax_iters': 70,
         'method_key': 'prismatic', 'resolution': 'Auto from max error',
         'face_count': 5000, 'preprocess_holes': True, 'face_groups': True,
@@ -1880,12 +1908,18 @@ def dev_purge_work(app, job):
     des = adsk.fusion.Design.cast(app.activeProduct)
     comp = des.rootComponent
     removed = []
-    for i in range(comp.meshBodies.count - 1, -1, -1):
+    # collect_mesh_bodies, not comp.meshBodies: the work meshes live wherever
+    # their source did, which for an imported STL assembly is inside a
+    # component. Scanning only the root found nothing and quietly reported
+    # success while the leftovers piled up.
+    found = []
+    collect_mesh_bodies(comp, found)
+    for b in reversed(found):
         try:
-            b = comp.meshBodies.item(i)
+            name_probe = b.name
         except Exception:
             continue
-        if '[work' not in b.name and not b.name.startswith(TMP_NAME):
+        if '[work' not in name_probe and not name_probe.startswith(TMP_NAME):
             continue
         name = b.name
         bf = adsk.fusion.BaseFeature.cast(b.baseOrFormFeature)
@@ -1901,7 +1935,9 @@ def dev_purge_work(app, job):
                 removed.append(name)
             except Exception:
                 log('could not delete %s\n%s' % (name, traceback.format_exc()))
-    return {'removed': removed, 'remaining': comp.meshBodies.count}
+    rest = []
+    collect_mesh_bodies(comp, rest)
+    return {'removed': removed, 'remaining': len(rest)}
 
 
 def dev_open_dialog(app, job):
