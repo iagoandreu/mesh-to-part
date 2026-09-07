@@ -449,6 +449,19 @@ def run_pipeline(app, src_body, o, progress=None):
     design = adsk.fusion.Design.cast(app.activeProduct)
     parametric = is_parametric(design)
     comp = src_body.parentComponent
+
+    # A solid can be offset too, and every line below here assumes a mesh body
+    # (isClosed, displayMesh, meshConvertFeatures). Tessellate once, right here,
+    # so exactly one place in the pipeline knows the difference exists.
+    if adsk.fusion.BRepBody.cast(src_body):
+        t_coords, t_idx = read_brep_triangles(src_body)
+        tess, _tb, _tn = add_mesh_body(comp, parametric, t_coords, t_idx,
+                                       '%s [work tess %s]'
+                                       % (src_body.name, time.strftime('%H%M%S')))
+        if not tess:
+            raise RuntimeError('Could not tessellate the solid body.')
+        src_body = tess
+
     rep = {'source': src_body.name, 'warnings': [], 'attempts': [], 'version': VERSION}
 
     def step(msg):
@@ -637,6 +650,29 @@ def run_pipeline(app, src_body, o, progress=None):
     if o['method_key'] == 'faceted':
         apply_faceted_cap()
 
+    # 4b - optional offset ("wrap"). A level-set offset, so it cannot
+    # self-intersect the way Offset Face and Shell do in a concavity.
+    if abs(float(o.get('wrap_offset_mm', 0.0))) > 1.0e-9:
+        step('Wrapping: offset %+.3f mm' % o['wrap_offset_mm'])
+        try:
+            w = refetch() or work
+            wc, wi = read_triangles(w)
+            wres = run_wrap(wc, wi,
+                            {'offset_mm': float(o['wrap_offset_mm']),
+                             'pitch_mm': float(o.get('wrap_pitch_mm', 0.0)),
+                             'close_mm': float(o.get('wrap_close_mm', 0.0)),
+                             'smooth_iters': int(o.get('wrap_smooth', 15))})
+            work, work_base, work_name = add_mesh_body(
+                comp, parametric, wres['coords'], wres['idx'],
+                '%s [work wrap %s]' % (rep['source'], time.strftime('%H%M%S')))
+            if not work:
+                raise RuntimeError('Could not create the offset mesh body.')
+            rep['wrap'] = wres['stats']
+        except Exception:
+            rep['warnings'].append('Wrap failed: %s'
+                                   % short_error(traceback.format_exc()))
+            log(traceback.format_exc())
+
     # 5 - the conversion ladder
     def apply_groups(spec):
         kind, angle, tol = spec
@@ -752,7 +788,10 @@ def run_pipeline(app, src_body, o, progress=None):
                           'wrap_iters': o['wrap_iters'],
                           'relax_iters': o['relax_iters'],
                           'ctrl': ctrl,
-                          'fair': o['fairness']}
+                          'fair': o['fairness'],
+                          'aspect_limit': float(o.get('aspect_limit', 0.0)),
+                          'aspect_iters': int(o.get('aspect_iters', 0)),
+                          'aspect_gain': float(o.get('aspect_gain', 2.0))}
                 w = refetch() or work
                 builder = (organic_form_body if o['method_key'] == 'form'
                            else organic_body)
@@ -992,6 +1031,26 @@ def format_report(rep, o, secs):
         L.append('  face groups       %d' % rep['face_groups'])
 
     L.append('')
+    if rep.get('wrap'):
+        w = rep['wrap']
+        a = w['achieved']
+        L.append('')
+        L.append('WRAP (level-set offset)')
+        L.append('  requested         %+.3f mm' % w['requested_offset_mm'])
+        L.append('  achieved          mean %+.4f   min %+.4f   max %+.4f mm'
+                 % (a['mean_mm'], a['min_mm'], a['max_mm']))
+        L.append('  spread            rms %.4f mm about that mean, %d points'
+                 % (a['rms_err_mm'], a['points']))
+        L.append('  voxel pitch       %.4f mm  (%.1f M voxels)'
+                 % (w['pitch_mm'], w['voxels'] / 1.0e6))
+        if w['close_mm']:
+            L.append('  gap closing       %.3f mm' % w['close_mm'])
+        L.append('  offset mesh       %d triangles, watertight %s'
+                 % (w['out_tris'], w['watertight']))
+        L.append('  NOTE the deviation below is measured against the OFFSET mesh,')
+        L.append('       not the body you selected.')
+
+
     L.append('CONVERSION')
     L.append('  method            %s%s'
              % (rep.get('method_label', o['method_label']),
@@ -1027,6 +1086,21 @@ def format_report(rep, o, secs):
             if e.get('cage_folded_quads') is not None:
                 L.append('    folded quads    %d of the cage (intrinsic test)'
                          % e['cage_folded_quads'])
+        q = e.get('cage_quality')
+        if q and q.get('after'):
+            aft = q['after']
+            bef = q.get('before')
+            L.append('    quad shape      aspect med %.2f  p95 %.2f  max %.2f'
+                     '   skew p95 %.2f'
+                     % (aft['aspect_median'], aft['aspect_p95'],
+                        aft['aspect_max'], aft['skew_p95']))
+            if bef:
+                L.append('                    was       med %.2f  p95 %.2f  max %.2f'
+                         '   skew p95 %.2f  (limit %.2f)'
+                         % (bef['aspect_median'], bef['aspect_p95'],
+                            bef['aspect_max'], bef['skew_p95'], aft['limit']))
+            L.append('    %d of %d quads still exceed the aspect limit'
+                     % (aft['over_limit'], aft['quads']))
         if e.get('signed_volume_mm3'):
             L.append('    closed volume   %.1f vs mesh %.1f mm3  (%+.3f %%)'
                      % (e['signed_volume_mm3'], e['mesh_volume_mm3'],
@@ -1103,7 +1177,8 @@ DEFAULTS = {
     'preprocessHoles': True, 'faceGroups': True, 'featureAngle': 25.0, 'minGroup': 0.02,
     'opType': 0, 'verify': True, 'hideSource': True, 'showReport': True,
     'cage': 24, 'fairness': 0.01, 'wrapIters': 50, 'relaxIters': 70,
-    'ctrlRatio': 0.5,
+    'ctrlRatio': 0.5, 'wrapOffset': 0.0, 'wrapClose': 0.0,
+    'aspectLimit': 3.0, 'aspectPasses': 80,
     'cageAuto': True,
     'fallbackFaceted': True,
 }
@@ -1132,8 +1207,10 @@ def save_settings(d):
 # --------------------------------------------------------------------------- #
 
 def build_inputs(inputs, s):
-    sel = inputs.addSelectionInput('selMesh', 'Mesh body', 'Select the mesh body to convert')
+    sel = inputs.addSelectionInput('selMesh', 'Body',
+                                   'Select a mesh body, or a solid to offset')
     sel.addSelectionFilter('MeshBodies')
+    sel.addSelectionFilter('SolidBodies')
     sel.setSelectionLimits(1, 0)
 
     info = inputs.addTextBoxCommandInput('info', 'Mesh', '', 7, True)
@@ -1189,6 +1266,15 @@ def build_inputs(inputs, s):
     c.addFloatSpinnerCommandInput(
         'ctrlRatio', 'Organic: control net / cage (NURBS only)', '',
         0.2, 1.0, 0.05, float(s['ctrlRatio']))
+    c.addFloatSpinnerCommandInput(
+        'aspectLimit', 'Organic: max quad aspect (0 = off)', '',
+        0.0, 20.0, 0.5, float(s['aspectLimit']))
+    c.addIntegerSpinnerCommandInput('aspectPasses', 'Organic: quad shape passes',
+                                    0, 400, 10, int(s['aspectPasses']))
+    c.addValueInput('wrapOffset', 'Wrap: offset distance (0 = off)', 'mm',
+                    adsk.core.ValueInput.createByReal(float(s['wrapOffset']) * MM))
+    c.addValueInput('wrapClose', 'Wrap: close gaps up to', 'mm',
+                    adsk.core.ValueInput.createByReal(float(s['wrapClose']) * MM))
     c.addFloatSpinnerCommandInput('fairness', 'Organic: fairness (NURBS only)', '',
                                   0.0, 1.0, 0.005, float(s['fairness']))
     c.addIntegerSpinnerCommandInput('relaxIters', 'Organic: relax passes',
@@ -1276,7 +1362,8 @@ def refresh_visibility(inputs):
     inputs.itemById('faceCount').isVisible = by_count
     inputs.itemById('facetedCap').isVisible = key == 'faceted'
     custom = key in ('custom_organic', 'form')
-    for cid in ('cageAuto', 'fairness', 'relaxIters', 'ctrlRatio'):
+    for cid in ('cageAuto', 'fairness', 'relaxIters', 'ctrlRatio',
+                'aspectLimit', 'aspectPasses'):
         inputs.itemById(cid).isVisible = custom
     inputs.itemById('cage').isVisible = custom and not inputs.itemById('cageAuto').value
     inputs.itemById('preprocessHoles').isVisible = organic
@@ -1320,6 +1407,10 @@ def resolve_options(inputs):
         'cage': inputs.itemById('cage').value,
         'cage_auto': inputs.itemById('cageAuto').value,
         'ctrl_ratio': inputs.itemById('ctrlRatio').value,
+        'aspect_limit': inputs.itemById('aspectLimit').value,
+        'aspect_iters': inputs.itemById('aspectPasses').value,
+        'wrap_offset_mm': inputs.itemById('wrapOffset').value * CM,
+        'wrap_close_mm': inputs.itemById('wrapClose').value * CM,
         'fairness': inputs.itemById('fairness').value,
         'wrap_iters': 50,
         'relax_iters': inputs.itemById('relaxIters').value,
@@ -1359,6 +1450,10 @@ def settings_from(inputs):
         'cage': inputs.itemById('cage').value,
         'cageAuto': inputs.itemById('cageAuto').value,
         'ctrlRatio': inputs.itemById('ctrlRatio').value,
+        'aspectLimit': inputs.itemById('aspectLimit').value,
+        'aspectPasses': inputs.itemById('aspectPasses').value,
+        'wrapOffset': inputs.itemById('wrapOffset').value * CM,
+        'wrapClose': inputs.itemById('wrapClose').value * CM,
         'fairness': inputs.itemById('fairness').value,
         'relaxIters': inputs.itemById('relaxIters').value,
         'fallbackFaceted': inputs.itemById('fallbackFaceted').value,
@@ -1637,7 +1732,49 @@ def dev_ping(app, job):
                         ('parametric' if is_parametric(des) else 'direct')),
         'brep_bodies': 0 if not des else des.rootComponent.bRepBodies.count,
         'mesh_bodies': bodies,
+        'solid_bodies': [] if not des else collect_brep_info(des.rootComponent),
     }
+
+
+def collect_brep_bodies(comp, out):
+    """Every BRep body in the assembly, at any depth (see collect_mesh_bodies)."""
+    for i in range(comp.bRepBodies.count):
+        out.append(comp.bRepBodies.item(i))
+    try:
+        occs = comp.allOccurrences
+    except Exception:
+        return
+    for i in range(occs.count):
+        occ = occs.item(i)
+        try:
+            bodies = occ.component.bRepBodies
+            for j in range(bodies.count):
+                out.append(bodies.item(j).createForAssemblyContext(occ))
+        except Exception:
+            pass
+
+
+def collect_brep_info(comp):
+    found = []
+    collect_brep_bodies(comp, found)
+    out = []
+    for b in found:
+        try:
+            bb = b.boundingBox
+            out.append({
+                'name': b.name,
+                'component': b.parentComponent.name,
+                'faces': b.faces.count,
+                'solid': b.isSolid,
+                'visible': b.isVisible,
+                'volume_mm3': round(b.volume * 1000.0, 1),
+                'size_mm': [round((bb.maxPoint.x - bb.minPoint.x) * CM, 2),
+                            round((bb.maxPoint.y - bb.minPoint.y) * CM, 2),
+                            round((bb.maxPoint.z - bb.minPoint.z) * CM, 2)],
+            })
+        except Exception:
+            pass
+    return out
 
 
 def dev_probe(app, job):
@@ -1781,8 +1918,10 @@ def dev_convert(app, job):
     des = adsk.fusion.Design.cast(app.activeProduct)
     found = []
     collect_mesh_bodies(des.rootComponent, found)
+    # solids are convertible too now: the pipeline tessellates them at entry
+    collect_brep_bodies(des.rootComponent, found)
     if not found:
-        return {'error': 'no mesh body in the active document'}
+        return {'error': 'no body in the active document'}
     b = _pick_body(found, job)
     o = dev_options(job.get('options', {}))
     t0 = time.time()
@@ -1801,6 +1940,8 @@ def dev_options(over):
         'reduce': True, 'reduce_over': 150000, 'reduce_share': 0.4,
         'faceted_cap': 20000, 'fallback_faceted': True,
         'cage': 24, 'cage_auto': False, 'fairness': 0.01, 'ctrl_ratio': 1.0,
+        'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
+        'aspect_limit': 3.0, 'aspect_iters': 80, 'aspect_gain': 2.0,
         'wrap_iters': 50, 'relax_iters': 70,
         'method_key': 'prismatic', 'resolution': 'Auto from max error',
         'face_count': 5000, 'preprocess_holes': True, 'face_groups': True,
@@ -1921,23 +2062,22 @@ def dev_purge_work(app, job):
             continue
         if '[work' not in name_probe and not name_probe.startswith(TMP_NAME):
             continue
-        name = b.name
-        bf = adsk.fusion.BaseFeature.cast(b.baseOrFormFeature)
+        name = name_probe
+        if not job.get('confirm'):
+            removed.append(name)          # dry run: report, change nothing
+            continue
         try:
-            if bf:
-                bf.deleteMe()
-            else:
-                b.deleteMe()
+            b.deleteMe()                  # the BODY only, never its BaseFeature
             removed.append(name)
         except Exception:
-            try:
-                b.deleteMe()
-                removed.append(name)
-            except Exception:
-                log('could not delete %s\n%s' % (name, traceback.format_exc()))
+            log('could not delete ' + name)
+            log(traceback.format_exc())
+
     rest = []
     collect_mesh_bodies(comp, rest)
-    return {'removed': removed, 'remaining': len(rest)}
+    return {'dry_run': not bool(job.get('confirm')),
+            'removed' if job.get('confirm') else 'would_remove': removed,
+            'remaining': len(rest)}
 
 
 def dev_open_dialog(app, job):
@@ -2293,6 +2433,7 @@ def dev_export_mesh(app, job):
 # --------------------------------------------------------------------------- #
 
 ORGANIC_ENGINE = os.path.join(ADDIN_DIR, 'mtp_organic.py')
+WRAP_ENGINE = os.path.join(ADDIN_DIR, 'mtp_wrap.py')
 
 
 def _pt(v):
@@ -2416,6 +2557,76 @@ def build_brep(res, swap, log_lines):
     body = bd.createBody()
     log_lines.extend(list(bd.outcomeInfo or []))
     return body
+
+
+def read_brep_triangles(body):
+    """(coords_cm, tri_idx) from a SOLID body, via its display tessellation.
+
+    displayMeshes.bestMesh, not a TriangleMeshCalculator: the calculator can
+    take Fusion down on a large organic body, and the display mesh is already
+    as fine as the viewport is showing.
+    """
+    tm = body.meshManager.displayMeshes.bestMesh
+    return list(tm.nodeCoordinatesAsDouble), list(tm.nodeIndices)
+
+
+def run_wrap(coords, idx, params, timeout=3600):
+    """Hand a mesh to the offset engine and get the offset mesh back."""
+    import subprocess
+    work = os.path.join(ADDIN_DIR, 'devjobs')
+    os.makedirs(work, exist_ok=True)
+    jp = os.path.join(work, 'wrap_job.json')
+    op = os.path.join(work, 'wrap_out.json')
+    job = dict(params)
+    job['coords'] = coords
+    job['idx'] = idx
+    with open(jp, 'w', encoding='utf-8') as fh:
+        json.dump(job, fh)
+    if os.path.exists(op):
+        os.remove(op)
+    exe = python_cmd()
+    if not exe:
+        raise RuntimeError(
+            'No Python with numpy, scipy, trimesh and pyvista was found. Set '
+            'MESHTOPART_PYTHON, or put the interpreter path in python_path.txt '
+            'next to the add-in.')
+    r = subprocess.run(exe + [WRAP_ENGINE, jp, op], capture_output=True,
+                       text=True, timeout=timeout, creationflags=NO_WINDOW)
+    if not os.path.exists(op):
+        raise RuntimeError('wrap engine produced nothing (rc=%s)\n%s\n%s'
+                           % (r.returncode, r.stdout[-800:], r.stderr[-800:]))
+    with open(op, encoding='utf-8') as fh:
+        res = json.load(fh)
+    if not res.get('ok'):
+        raise RuntimeError('wrap engine failed:\n%s' % res.get('error', '')[-1200:])
+    return res
+
+
+def wrap_body(app, src_body, params, log_lines):
+    """Offset any body -- mesh or solid -- and drop the result in as a mesh.
+
+    Returns (mesh_body, engine result). Fusion's Offset Face and Shell are per
+    face and give up when an outward offset self-intersects in a concavity;
+    this goes through a signed distance field, where that case simply cannot
+    arise.
+    """
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    parametric = is_parametric(design)
+    comp = src_body.parentComponent
+
+    if adsk.fusion.BRepBody.cast(src_body):
+        coords, idx = read_brep_triangles(src_body)
+    else:
+        coords, idx = read_triangles(src_body)
+
+    res = run_wrap(coords, idx, params)
+    log_lines.extend(res.get('log', []))
+
+    name = '%s [wrap %+.2f]' % (src_body.name, params['offset_mm'])
+    body, base, actual = add_mesh_body(comp, parametric, res['coords'],
+                                       res['idx'], name)
+    res['stats']['body'] = actual
+    return body, res, base
 
 
 def organic_body(app, src_body, params, log_lines):
@@ -2711,7 +2922,60 @@ def _pick_body(found, job):
         for b in found:
             if b.name == want:
                 return b
+        # falling through to found[0] here meant a mistyped or solid-only name
+        # silently ran against a completely different body, and the failure that
+        # followed pointed at the wrong geometry
+        raise RuntimeError('body %r not found. Available: %s'
+                           % (want, ', '.join(b.name for b in found) or 'none'))
     return found[0]
+
+
+def dev_wrap(app, job):
+    """Offset a body by a distance, optionally refitting it back to a solid."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    want = job.get('body')
+    found = []
+    collect_brep_bodies(des.rootComponent, found)
+    collect_mesh_bodies(des.rootComponent, found)
+    src = None
+    for b in found:
+        if b.name == want:
+            src = b
+            break
+    if src is None:
+        return {'error': 'body %r not found' % want,
+                'available': [b.name for b in found]}
+
+    o = job.get('options', {})
+    params = {'offset_mm': float(o.get('offset_mm', 2.0)),
+              'pitch_mm': float(o.get('pitch_mm', 0.0)),
+              'close_mm': float(o.get('close_mm', 0.0)),
+              'smooth_iters': int(o.get('smooth_iters', 15)),
+              'budget': float(o.get('budget', 15.0e6))}
+    logs = []
+    t0 = time.time()
+    mesh_body, res, _base = wrap_body(app, src, params, logs)
+    out = {'source': src.name, 'wrap': res['stats']}
+
+    if o.get('solid'):
+        cage = int(o.get('cage', 48))
+        m = cage + 1
+        fit = {'cage': cage,
+               'wrap_iters': 50,
+               'relax_iters': int(o.get('relax_iters', 200)),
+               'ctrl': max(6, min(m, int(round(float(o.get('ctrl_ratio', 0.5)) * m)))),
+               'fair': float(o.get('fairness', 0.01))}
+        body, eres, _b2 = organic_body(app, mesh_body, fit, logs)
+        try:
+            body.name = '%s [wrap %+.2f solid]' % (src.name, params['offset_mm'])
+        except Exception:
+            pass
+        out['solid'] = body.name
+        out['fit'] = eres['stats']
+
+    out['secs'] = round(time.time() - t0, 2)
+    out['log'] = logs[-40:]
+    return out
 
 
 DEV_COMMANDS = {
@@ -2726,6 +2990,7 @@ DEV_COMMANDS = {
     'close_doc': dev_close_doc,
     'rebuild_toolbar': dev_rebuild_toolbar,
     'purge_work': dev_purge_work,
+    'wrap': dev_wrap,
     'open_dialog': dev_open_dialog,
     'read_dialog': dev_read_dialog,
     'set_inputs': dev_set_inputs,

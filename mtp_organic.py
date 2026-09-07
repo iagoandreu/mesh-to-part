@@ -309,6 +309,104 @@ def folded_quads(points, quads, proj=None):
     return (nq_unit * field).sum(axis=1) < 0.0, ln
 
 
+def quad_metrics(points, quads):
+    """Per-quad aspect ratio and skew.
+
+    quad_arrays orders the corners a -> b (+u) -> c (+u+v) -> d (+v), so the two
+    u-edges are a-b and d-c, and the two v-edges are a-d and b-c.
+
+    aspect  longer edge family over the shorter; 1.0 is square
+    skew    |cos| of the angle between the u and v directions; 0.0 is square,
+            1.0 is a fully collapsed sliver
+    """
+    a, b, c, d = quads
+    ab = points[b] - points[a]
+    dc = points[c] - points[d]
+    ad = points[d] - points[a]
+    bc = points[c] - points[b]
+    eu = 0.5 * (np.linalg.norm(ab, axis=1) + np.linalg.norm(dc, axis=1))
+    ev = 0.5 * (np.linalg.norm(ad, axis=1) + np.linalg.norm(bc, axis=1))
+    aspect = np.maximum(eu, ev) / np.maximum(np.minimum(eu, ev), 1.0e-30)
+    u = ab + dc
+    v = ad + bc
+    u = u / np.maximum(np.linalg.norm(u, axis=1), 1.0e-30)[:, None]
+    v = v / np.maximum(np.linalg.norm(v, axis=1), 1.0e-30)[:, None]
+    skew = np.abs((u * v).sum(axis=1))
+    return aspect, skew, eu, ev
+
+
+def aspect_report(points, quads, limit):
+    aspect, skew, _eu, _ev = quad_metrics(points, quads)
+    return {
+        'aspect_median': float(np.median(aspect)),
+        'aspect_p95': float(np.percentile(aspect, 95)),
+        'aspect_max': float(aspect.max()),
+        'skew_p95': float(np.percentile(skew, 95)),
+        'skew_max': float(skew.max()),
+        'over_limit': int((aspect > limit).sum()),
+        'quads': int(len(aspect)),
+        'limit': float(limit),
+    }
+
+
+def vertex_badness(points, quads, n_verts, limit):
+    """How much each cage vertex is implicated in a badly shaped quad.
+
+    Only quads that actually breach the limit contribute anything, so a
+    relaxation driven by this leaves the square, well-fitting regions of the
+    cage alone rather than smoothing everything and washing out the detail that
+    was already landing correctly.
+    """
+    aspect, skew, _eu, _ev = quad_metrics(points, quads)
+    bad = np.maximum(aspect / max(limit, 1.0e-9) - 1.0, 0.0)
+    bad = bad + 2.0 * np.maximum(skew - 0.5, 0.0)
+    acc = np.zeros(n_verts)
+    cnt = np.zeros(n_verts)
+    for arr in quads:
+        np.add.at(acc, arr, bad)
+        np.add.at(cnt, arr, 1.0)
+    return acc / np.maximum(cnt, 1.0)
+
+
+def relax_quality(points, table, quads, proj, fid, iters, limit, gain, log):
+    """Tangential relaxation weighted by how badly shaped each quad is.
+
+    A uniform relaxation has to stay weak or it washes out the parts of the cage
+    that are tracking the surface properly -- which leaves the long thin slivers
+    that collect along a crease exactly as they were. Those slivers are what the
+    limit surface renders as a crease of its own, and what makes a downstream
+    fillet fail. Weighting each vertex's step by the badness of the quads it
+    belongs to spends the smoothing only where the shape is actually wrong.
+    """
+    for it in range(iters):
+        nrm = proj.normal[fid]
+        nrm = nrm + neighbour_mean(nrm, table)
+        nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-30)[:, None]
+
+        bad = vertex_badness(points, quads, len(points), limit)
+        if bad.max() <= 0.0:
+            if log:
+                log('  quality %3d/%d  every quad already within aspect %.2f'
+                    % (it + 1, iters, limit))
+            break
+        w = np.clip(gain * bad, 0.0, 0.9)
+
+        disp = laplacian(points, table)
+        disp = disp - (disp * nrm).sum(axis=1)[:, None] * nrm
+        step = w[:, None] * disp
+        lim = 0.35 * spacing(points, table)
+        ln = np.linalg.norm(step, axis=1)
+        step = step * np.minimum(1.0, lim / np.maximum(ln, 1e-30))[:, None]
+        points, _bad = safe_step_mesh(points, step, quads, proj)
+        points, _d, fid = proj(points, k=16, exact=False)
+        if log and (it % 10 == 0 or it == iters - 1):
+            r = aspect_report(points, quads, limit)
+            log('  quality %3d/%d  aspect med %.2f p95 %.2f max %.2f  over limit %d'
+                % (it + 1, iters, r['aspect_median'], r['aspect_p95'],
+                   r['aspect_max'], r['over_limit']))
+    return points, fid
+
+
 def safe_step_mesh(points, step, quads, proj, tries=4, bad_before=None):
     """Apply a displacement, backing off only where it would create a NEW fold.
 
@@ -386,7 +484,8 @@ def untangle(points, table, quads, proj, passes, log):
 
 
 def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_end,
-                sample_count, tangential_iters, untangle_passes, log):
+                sample_count, tangential_iters, untangle_passes, log,
+                aspect_limit=0.0, aspect_iters=0, aspect_gain=1.2):
     """Pull the cage onto the mesh, then let it slide along the surface.
 
     Phase 1 - free wrap. A KD-tree over a dense surface sample drives it, which is
@@ -452,10 +551,31 @@ def shrink_wrap(mesh, proj, points, table, grids, iters, smooth_start, smooth_en
             log('  relax %3d/%d  w %.3f  spacing CV %.4f  folded %d'
                 % (it + 1, tangential_iters, w, spacing_cv(points, table),
                    int(bad.sum())))
+    quality = None
+    if aspect_iters > 0 and aspect_limit > 0.0:
+        before = aspect_report(points, quads, aspect_limit)
+        if log:
+            log('  cage quads before quality relax: aspect med %.2f p95 %.2f '
+                'max %.2f, %d of %d over %.2f'
+                % (before['aspect_median'], before['aspect_p95'],
+                   before['aspect_max'], before['over_limit'],
+                   before['quads'], aspect_limit))
+        points, fid = relax_quality(points, table, quads, proj, fid,
+                                    int(aspect_iters), float(aspect_limit),
+                                    float(aspect_gain), log)
+        quality = {'before': before,
+                   'after': aspect_report(points, quads, aspect_limit)}
+
     points, n_folded = untangle(points, table, quads, proj,
                                 int(untangle_passes), log)
     points, _d, _f = proj(points)          # exact landing
-    return points, n_folded
+    if quality is not None:
+        # untangle moves points too, so the number that gets reported is the one
+        # measured on the cage that is actually used
+        quality['after'] = aspect_report(points, quads, aspect_limit)
+    elif aspect_limit > 0.0:
+        quality = {'after': aspect_report(points, quads, aspect_limit)}
+    return points, n_folded, quality
 
 
 # --------------------------------------------------------------------------- #
@@ -970,7 +1090,7 @@ def build(job, log):
     log('cage %d verts, start sphere r=%.2f mm' % (len(points), radius * 10.0))
 
     proj = Projector(mesh)
-    points, cage_folds = shrink_wrap(
+    points, cage_folds, cage_quality = shrink_wrap(
         mesh, proj, points, table, grids,
         iters=int(job.get('wrap_iters', 50)),
         smooth_start=float(job.get('smooth_start', 0.55)),
@@ -978,7 +1098,10 @@ def build(job, log):
         sample_count=int(job.get('samples', 120000)),
         tangential_iters=int(job.get('relax_iters', 60)),
         untangle_passes=int(job.get('untangle', 12)),
-        log=log)
+        log=log,
+        aspect_limit=float(job.get('aspect_limit', 0.0)),
+        aspect_iters=int(job.get('aspect_iters', 0)),
+        aspect_gain=float(job.get('aspect_gain', 1.2)))
     _c, dcage, _f = proj(points)
     log('cage sits on the mesh to %.5f mm' % (dcage.max() * 10.0))
 
@@ -1012,6 +1135,7 @@ def build(job, log):
                 'cage_verts': int(len(pts)),
                 'cage_quads': int(len(quads)),
                 'cage_folded_quads': int(folded.sum()),
+                'cage_quality': cage_quality,
                 'limit_regularisation': lam_used,
                 'limit_at_cage_max_mm': lim_max,
                 'limit_at_cage_mean_mm': lim_mean,
@@ -1153,6 +1277,7 @@ def build(job, log):
             'fairness': lam,
             'cage_on_mesh_max_mm': float(dcage.max() * 10.0),
             'cage_folded_quads': int(cage_folds),
+            'cage_quality': cage_quality,
             'signed_volume_mm3': signed_vol * 1000.0,
             'mesh_volume_mm3': float(mesh.volume) * 1000.0,
             'winding_consistent': bool(surf_mesh_tmp.is_winding_consistent),
