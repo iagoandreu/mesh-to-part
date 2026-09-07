@@ -29,6 +29,15 @@ import traceback
 
 CMD_ID = 'MeshToPart_Convert'
 CMD_NAME = 'Mesh to Part'
+WRAP_CMD_ID = 'MeshToPart_Wrap'
+WRAP_CMD_NAME = 'Wrap (offset)'
+WRAP_TOOLTIP = (
+    'Grow or shrink a body by a distance, through a signed distance field.\n\n'
+    'Offset Face and Shell work face by face and give up when an outward offset\n'
+    'self-intersects in a concavity. A level set cannot hit that case: the material\n'
+    'merges wherever the concave radius is smaller than the offset. The tool then\n'
+    'measures the offset it actually achieved.'
+)
 CMD_TOOLTIP = (
     'Convert a mesh body (imported STL) into a solid or Form part.\n\n'
     'You give a maximum error budget and a maximum gap to ignore; the tool prepares '
@@ -131,6 +140,46 @@ class _Validate(adsk.core.ValidateInputsEventHandler):
     def notify(self, args):
         try:
             args.areInputsValid = _core().on_validate(args.inputs)
+        except Exception:
+            args.areInputsValid = False
+
+
+
+class _WrapCreated(adsk.core.CommandCreatedEventHandler):
+    def notify(self, args):
+        try:
+            cmd = args.command
+            _core().on_wrap_created(_app, cmd)
+            for h, ev in ((_WrapExecute(), cmd.execute),
+                          (_WrapChanged(), cmd.inputChanged),
+                          (_WrapValidate(), cmd.validateInputs)):
+                ev.add(h)
+                _handlers.append(h)
+        except Exception:
+            _fail('Wrap could not open its dialog.')
+
+
+class _WrapExecute(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        try:
+            _core().on_wrap_execute(_app, _ui, args.command.commandInputs)
+        except Exception:
+            _fail('Wrap failed.')
+
+
+class _WrapChanged(adsk.core.InputChangedEventHandler):
+    def notify(self, args):
+        try:
+            _core().on_wrap_input_changed(
+                _app, args.input.parentCommand.commandInputs, args.input.id)
+        except Exception:
+            _log(traceback.format_exc())
+
+
+class _WrapValidate(adsk.core.ValidateInputsEventHandler):
+    def notify(self, args):
+        try:
+            args.areInputsValid = _core().on_wrap_validate(args.inputs)
         except Exception:
             args.areInputsValid = False
 
@@ -273,6 +322,18 @@ def run(context):
         placed = _core().place_button(_ui, cmd_def)
         _log('button placed in %s' % (placed or 'NO PANEL'))
 
+        old_wrap = _ui.commandDefinitions.itemById(WRAP_CMD_ID)
+        if old_wrap:
+            old_wrap.deleteMe()
+        wrap_def = _ui.commandDefinitions.addButtonDefinition(
+            WRAP_CMD_ID, WRAP_CMD_NAME, WRAP_TOOLTIP, RES_DIR)
+        wh = _WrapCreated()
+        wrap_def.commandCreated.add(wh)
+        _handlers.append(wh)
+        wplaced = _core().place_button(_ui, wrap_def,
+                                       _core().WRAP_PANEL_GROUPS)
+        _log('wrap button placed in %s' % (wplaced or 'NO PANEL'))
+
         if os.path.exists(DEV_FLAG):
             _start_bridge()
         _log('started')
@@ -289,9 +350,10 @@ def stop(context):
             except Exception:
                 pass
         _controls[:] = []
-        cmd_def = _ui.commandDefinitions.itemById(CMD_ID)
-        if cmd_def:
-            cmd_def.deleteMe()
+        for cid in (CMD_ID, WRAP_CMD_ID):
+            cmd_def = _ui.commandDefinitions.itemById(cid)
+            if cmd_def:
+                cmd_def.deleteMe()
         _handlers[:] = []
         _log('stopped')
     except Exception:

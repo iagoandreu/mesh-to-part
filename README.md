@@ -28,6 +28,7 @@ This add-in adds two methods of its own that need no extension:
 |---|---|---|
 | **Organic Form (T-Spline)** | a real **Form body**, 6 patches, editable with Fusion's sculpt tools | no |
 | **Organic NURBS** | a 6-patch NURBS solid, watertight by construction | no |
+| **Organic Form (quad cage)** | a Form body whose cage is a size-driven quad mesh, not a stretched cube | no |
 | Prismatic | Fusion's own — planes, cylinders, cones | no |
 | Faceted | Fusion's own — one face per triangle, exact | no |
 | Organic | Fusion's own T-Spline conversion | **yes** |
@@ -56,6 +57,29 @@ On the calcaneus, judge by p95/RMS. The max sits at a handful of isolated 150°
 creases in a mesh whose mean edge length is 15.7 mm — no smooth surface reproduces
 those, and Fusion's own Organic conversion would round them too.
 
+## Wrap (offset)
+
+A second command, in **Mesh -> Modify** and **Solid -> Modify**. It grows or
+shrinks a body by a distance.
+
+Offset Face and Shell work face by face, and they give up on organic geometry
+because an outward offset self-intersects wherever the concave radius is smaller
+than the offset -- between toes, behind a malleolus. A level set has no such
+case: the isosurface at distance *d* IS the offset, and the material merging in a
+concavity is automatic rather than a failure. So the body is rasterised to a
+signed distance field, the isolevel is shifted, and the surface re-extracted.
+
+The distance transform alone is not accurate enough -- it measures to voxel
+centres and counts a partly covered voxel as solid, biasing the result outward by
+about 0.4 x the voxel pitch. Exact point-to-surface distance is computed in a
+narrow band around the isolevel, which is a thin shell and therefore cheap.
+Measured on a 20 mm sphere: **+4.0 mm asked, 3.9987 mm achieved**; -3.0 mm asked,
+-3.0019 mm achieved. On a 75k-triangle skin scan, +4.0 mm gives mean 3.9989, min
+3.9492, max 4.1288, rms 0.0087 mm, in 8.9 s.
+
+It reports the offset it actually achieved rather than assuming it hit the
+number. Output is a mesh body, or straight through to a solid.
+
 ## Install
 
 1. Clone or copy this folder anywhere.
@@ -71,8 +95,13 @@ The organic fitting runs in a Python with **numpy, scipy and trimesh**, because
 Fusion's bundled interpreter has none of them:
 
 ```
-pip install numpy scipy trimesh
+pip install numpy scipy trimesh pyvista
 ```
+
+`pyvista` is needed by the Wrap tool (VTK marching cubes and exact
+point-to-surface distance). The **quad cage** method additionally needs
+`pip install gmsh`; without it that one method is simply absent from the
+list and everything else works.
 
 The add-in finds an interpreter automatically — the `MESHTOPART_PYTHON`
 environment variable, a `python_path.txt` beside the add-in, the usual install

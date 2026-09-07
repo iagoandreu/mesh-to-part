@@ -2158,10 +2158,19 @@ PANEL_GROUPS = [
 ]
 
 
-def place_button(ui, cmd_def):
+WRAP_CMD_ID = 'MeshToPart_Wrap'
+WRAP_CMD_NAME = 'Wrap (offset)'
+# Modify, not Create: a wrap takes a body you already have and grows it.
+WRAP_PANEL_GROUPS = [
+    ['ParaMeshModifyPanel', 'MeshModifyPanel', 'ParaMeshPreparePanel'],
+    ['SolidModifyPanel', 'SolidCreatePanel'],
+]
+
+
+def place_button(ui, cmd_def, groups=None):
     """Put the button in the first panel of each group that exists. Returns the ids."""
     placed = []
-    for group in PANEL_GROUPS:
+    for group in (PANEL_GROUPS if groups is None else groups):
         for pid in group:
             panel = ui.allToolbarPanels.itemById(pid)
             if not panel:
@@ -2175,6 +2184,165 @@ def place_button(ui, cmd_def):
             placed.append(pid)
             break
     return placed
+
+
+
+# --------------------------------------------------------------------------- #
+# the Wrap command - a level-set offset as a tool of its own
+# --------------------------------------------------------------------------- #
+
+WRAP_OUTPUTS = ['Offset mesh body only',
+                'Solid: quad cage Form (size-driven)',
+                'Solid: organic NURBS']
+
+WRAP_DEFAULTS = {
+    'wOffset': 4.0, 'wClose': 0.0, 'wSmooth': 0, 'wOutput': 0,
+    'wQuadSize': 8.0, 'wMinEdge': 1.5, 'wCurv': 16, 'wHide': True,
+}
+
+
+def wrap_settings():
+    d = dict(WRAP_DEFAULTS)
+    try:
+        with open(SETTINGS_PATH + '.wrap', 'r', encoding='utf-8') as fh:
+            d.update(json.load(fh))
+    except Exception:
+        pass
+    return d
+
+
+def save_wrap_settings(d):
+    try:
+        with open(SETTINGS_PATH + '.wrap', 'w', encoding='utf-8') as fh:
+            json.dump(d, fh, indent=2)
+    except Exception:
+        log(traceback.format_exc())
+
+
+def on_wrap_created(app, cmd):
+    """Dialog for the Wrap tool."""
+    cmd.isExecutedWhenPreEmpted = False
+    cmd.okButtonText = 'Wrap'
+    s = wrap_settings()
+    inputs = cmd.commandInputs
+
+    sel = inputs.addSelectionInput('wSel', 'Body', 'Select a mesh body or a solid')
+    sel.addSelectionFilter('MeshBodies')
+    sel.addSelectionFilter('SolidBodies')
+    sel.setSelectionLimits(1, 1)
+
+    inputs.addValueInput('wOffset', 'Offset distance', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['wOffset']) * MM))
+    inputs.addValueInput('wClose', 'Close gaps up to', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['wClose']) * MM))
+    inputs.addIntegerSpinnerCommandInput('wSmooth', 'Smooth creases: passes',
+                                         0, 200, 5, int(s['wSmooth']))
+    dd = inputs.addDropDownCommandInput('wOutput', 'Create',
+                                        adsk.core.DropDownStyles.TextListDropDownStyle)
+    for i, lab in enumerate(WRAP_OUTPUTS):
+        dd.listItems.add(lab, i == int(s['wOutput']))
+    inputs.addValueInput('wQuadSize', 'Solid: target element size', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['wQuadSize']) * MM))
+    inputs.addValueInput('wMinEdge', 'Solid: min element edge', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['wMinEdge']) * MM))
+    inputs.addIntegerSpinnerCommandInput('wCurv', 'Solid: elements per curvature circle',
+                                         0, 60, 2, int(s['wCurv']))
+    inputs.addBoolValueInput('wHide', 'Hide the original', True, '', bool(s['wHide']))
+    inputs.addTextBoxCommandInput('wInfo', '', '', 3, True)
+    on_wrap_input_changed(app, inputs, 'wOutput')
+
+
+def on_wrap_input_changed(app, inputs, changed_id):
+    idx = inputs.itemById('wOutput').selectedItem.index
+    for cid in ('wQuadSize', 'wMinEdge', 'wCurv'):
+        inputs.itemById(cid).isVisible = (idx == 1)
+    off = inputs.itemById('wOffset').value * CM
+    tail = ('' if idx else ' The result is a mesh body; convert it with Mesh to '
+            'Part when you are happy with it.')
+    inputs.itemById('wInfo').formattedText = (
+        'Offsets through a signed distance field, so it cannot self-intersect '
+        'the way Offset Face and Shell do in a concavity: at %+.2f mm the '
+        'material simply merges wherever the concave radius is smaller than '
+        'that.%s' % (off, tail))
+
+
+def on_wrap_validate(inputs):
+    try:
+        return (inputs.itemById('wSel').selectionCount > 0
+                and abs(inputs.itemById('wOffset').value) > 1.0e-9)
+    except Exception:
+        return False
+
+
+def on_wrap_execute(app, ui, inputs):
+    """Run the offset, and optionally convert the result to a solid."""
+    t0 = time.time()
+    src = inputs.itemById('wSel').selection(0).entity
+    out_idx = inputs.itemById('wOutput').selectedItem.index
+    params = {'offset_mm': inputs.itemById('wOffset').value * CM,
+              'close_mm': inputs.itemById('wClose').value * CM,
+              'smooth_iters': int(inputs.itemById('wSmooth').value),
+              'pitch_mm': 0.0}
+    save_wrap_settings({
+        'wOffset': inputs.itemById('wOffset').value * CM,
+        'wClose': inputs.itemById('wClose').value * CM,
+        'wSmooth': inputs.itemById('wSmooth').value,
+        'wOutput': out_idx,
+        'wQuadSize': inputs.itemById('wQuadSize').value * CM,
+        'wMinEdge': inputs.itemById('wMinEdge').value * CM,
+        'wCurv': inputs.itemById('wCurv').value,
+        'wHide': inputs.itemById('wHide').value,
+    })
+
+    logs = []
+    mesh_body, res, _base = wrap_body(app, src, params, logs)
+    st = res['stats']
+    a = st['achieved']
+    lines = ['Wrap  %s  ->  %s' % (src.name, st.get('body', '?')),
+             '',
+             '  requested        %+.3f mm' % st['requested_offset_mm'],
+             '  achieved         mean %+.4f   min %+.4f   max %+.4f mm'
+             % (a['mean_mm'], a['min_mm'], a['max_mm']),
+             '  spread           rms %.4f mm about that mean' % a['rms_err_mm'],
+             '  voxel pitch      %.4f mm (%.1f M voxels)'
+             % (st['pitch_mm'], st['voxels'] / 1.0e6),
+             '  offset mesh      %d triangles, watertight %s'
+             % (st['out_tris'], st['watertight'])]
+
+    if inputs.itemById('wHide').value:
+        try:
+            src.isLightBulbOn = False
+        except Exception:
+            pass
+
+    if out_idx > 0:
+        o = dev_options({
+            'method_key': 'quad_cage' if out_idx == 1 else 'custom_organic',
+            'quad_size_mm': inputs.itemById('wQuadSize').value * CM,
+            'min_edge_mm': inputs.itemById('wMinEdge').value * CM,
+            'curvature': inputs.itemById('wCurv').value,
+            'max_attempts': 3, 'escalate': True, 'reduce': False,
+            'max_error_mm': 1.0, 'verify': True, 'hide_source': True,
+            'show_report': False,
+        })
+        try:
+            rep = run_pipeline(app, mesh_body, o, None)
+            lines.append('')
+            lines.append(format_report(rep, o, time.time() - t0))
+        except Exception:
+            lines.append('')
+            lines.append('  the solid conversion failed: %s'
+                         % short_error(traceback.format_exc()))
+            log(traceback.format_exc())
+
+    text = '\n'.join(lines)
+    path = write_report(text)
+    log(text)
+    try:
+        adsk.core.Application.log('Wrap: %s' % lines[3].strip())
+    except Exception:
+        pass
+    return path
 
 
 def dev_rebuild_toolbar(app, job):
