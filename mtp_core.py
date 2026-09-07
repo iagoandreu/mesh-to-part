@@ -2304,7 +2304,11 @@ def dev_tsm_try(app, job):
             try:
                 if ff:
                     ff.finishEdit()
-                    ff.deleteMe()
+                    # keep=true leaves the body in the document, which is the
+                    # difference between proving the parser accepts a cage and
+                    # being able to look at the thing in the Form environment
+                    if not job.get('keep'):
+                        ff.deleteMe()
             except Exception:
                 log(traceback.format_exc())
     return out
