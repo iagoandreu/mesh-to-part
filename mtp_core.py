@@ -1087,6 +1087,14 @@ def format_report(rep, o, secs):
                 L.append('    folded quads    %d of the cage (intrinsic test)'
                          % e['cage_folded_quads'])
         q = e.get('cage_quality')
+        if q and q.get('emitted'):
+            em = q['emitted']
+            L.append('    quad shape      aspect med %.2f  p95 %.2f  max %.2f'
+                     '   skew p95 %.2f   (as emitted)'
+                     % (em['aspect_median'], em['aspect_p95'],
+                        em['aspect_max'], em['skew_p95']))
+            L.append('    %d of %d emitted quads exceed the aspect limit %.2f'
+                     % (em['over_limit'], em['quads'], em['limit']))
         if q and q.get('after'):
             aft = q['after']
             bef = q.get('before')

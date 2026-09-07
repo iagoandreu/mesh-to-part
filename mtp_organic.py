@@ -394,7 +394,13 @@ def relax_quality(points, table, quads, proj, fid, iters, limit, gain, log):
         disp = laplacian(points, table)
         disp = disp - (disp * nrm).sum(axis=1)[:, None] * nrm
         step = w[:, None] * disp
-        lim = 0.35 * spacing(points, table)
+        # Cap the step against the TYPICAL cage spacing, not the point's own.
+        # A sliver's local spacing is tiny by definition, so a proportional cap
+        # freezes precisely the points that need to travel to escape it -- the
+        # first version of this pass moved the worst aspect on a real scan from
+        # 47.7 only to 35.7 for exactly that reason.
+        sp = spacing(points, table)
+        lim = 0.35 * np.maximum(sp, np.median(sp))
         ln = np.linalg.norm(step, axis=1)
         step = step * np.minimum(1.0, lim / np.maximum(ln, 1e-30))[:, None]
         points, _bad = safe_step_mesh(points, step, quads, proj)
@@ -1135,7 +1141,18 @@ def build(job, log):
                 'cage_verts': int(len(pts)),
                 'cage_quads': int(len(quads)),
                 'cage_folded_quads': int(folded.sum()),
-                'cage_quality': cage_quality,
+                # cage_quality is measured on the relaxed cage; the Form path
+                # then re-solves it so its limit surface lands on the mesh,
+                # which moves every point. Measure again on the cage that is
+                # actually emitted, or the reported shape is not the one the
+                # user will edit in the Form environment.
+                'cage_quality': (
+                    dict(cage_quality,
+                         emitted=aspect_report(pts, qa,
+                                               float(job.get('aspect_limit', 3.0))))
+                    if cage_quality else
+                    {'emitted': aspect_report(pts, qa,
+                                              float(job.get('aspect_limit', 3.0)))}),
                 'limit_regularisation': lam_used,
                 'limit_at_cage_max_mm': lim_max,
                 'limit_at_cage_mean_mm': lim_mean,
