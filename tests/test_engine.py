@@ -130,6 +130,97 @@ if res['ok']:
     check('the emitted TSM starts with the right magic',
           res['tsm'].startswith('#TS0200'))
 
+
+# --------------------------------------------------------------------------- #
+# a cage that is not all quads
+# --------------------------------------------------------------------------- #
+print('mixed-arity cage (the gmsh cage carries triangles)')
+
+# a cube with one face split into two triangles: still closed and manifold
+CP = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+               [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], float)
+CF = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5),
+      (3, 7, 6, 2), (0, 4, 7), (0, 7, 3)]
+
+L = M.limit_operator(len(CP), CF)
+rows = np.asarray(L.sum(axis=1)).ravel()
+check('the mixed-arity limit operator is affine (rows sum to 1)',
+      np.allclose(rows, 1.0), '%.3e' % np.abs(rows - 1.0).max())
+
+# repeated subdivision converges to the same limit, and originals keep their index
+p_sd, f_sd = CP.copy(), CF
+for _ in range(7):
+    p_sd, f_sd = M.catmull_clark(p_sd, f_sd)
+err = np.abs((L @ CP) - p_sd[:len(CP)]).max()
+check('it agrees with 7 rounds of subdivision', err < 1.0e-4, '%.3e' % err)
+
+# the all-quad path must be untouched by the generalisation
+QV, QG = M.cube_sphere(6)
+QQ = M.cage_quads(QG)
+direct = M.limit_matrix(len(QV), M.quad_arrays(QG),
+                        M.cage_neighbours(len(QV), QG))
+same = abs(direct - M.limit_operator(len(QV), QQ)).max()
+check('an all-quad cage still takes the closed-form mask exactly',
+      same == 0.0, same)
+
+lim = M.limit_surface_mesh(CP, CF, levels=2)[0]
+check('a mixed cage gives a finite limit surface (this is what produced NaN)',
+      np.isfinite(lim).all())
+
+# --------------------------------------------------------------------------- #
+# the scan-derived quad cage
+# --------------------------------------------------------------------------- #
+print('scan-derived quad cage')
+
+qv, qf = M.quadrangulate(np.asarray(sphere.vertices),
+                         [tuple(int(i) for i in t) for t in sphere.faces])
+check('quadrangulating a triangle mesh gives three quads per triangle',
+      len(qf) == 3 * len(sphere.faces), len(qf))
+check('every face is a quad', all(len(f) == 4 for f in qf))
+check('quadrangulation moves nothing: the originals keep their position',
+      np.allclose(qv[:len(sphere.vertices)], sphere.vertices))
+qtri = np.array([(f[0], f[1], f[2]) for f in qf]
+                + [(f[0], f[2], f[3]) for f in qf], np.int64)
+check('the quadrangulated cage is watertight',
+      trimesh.Trimesh(vertices=qv, faces=qtri, process=False).is_watertight)
+
+# 2 mm on a 30 mm sphere, which is what the dialog now defaults to
+res = run(sphere, cage_source='scan', hmax_mm=2.0, output='tsm', limit_iters=15)
+check('the scan cage produces a Form output', res['ok'],
+      res.get('error', '')[-200:])
+if res['ok']:
+    s = res['stats']
+    check('it reports which cage it used', s.get('cage_source') == 'scan',
+          s.get('cage_source'))
+    check('it measures how well the cage covers the scan',
+          (s.get('cage_cover') or {}).get('p99_mm', 99) < 1.0,
+          s.get('cage_cover'))
+    check('scan cage max deviation under 0.10 mm',
+          s['surf_to_mesh_max_mm'] < 0.10, s['surf_to_mesh_max_mm'])
+    check('scan cage has no folded quad', s['cage_folded_quads'] == 0,
+          s['cage_folded_quads'])
+    check('scan cage volume within 0.1%',
+          abs(s['signed_volume_mm3'] - s['mesh_volume_mm3'])
+          / s['mesh_volume_mm3'] < 1e-3)
+    check('a finer element is asked for and a finer cage arrives',
+          s['cage_quads'] > 200, s['cage_quads'])
+
+# the property the gmsh cage never had: asking for a smaller element gives a
+# better body. Its density came from a curvature field pinned at the size floor,
+# so every rung of the ladder produced the same cage.
+coarse = run(sphere, cage_source='scan', hmax_mm=4.0, output='tsm', limit_iters=15)
+fine = run(sphere, cage_source='scan', hmax_mm=1.5, output='tsm', limit_iters=15)
+if coarse['ok'] and fine['ok']:
+    check('a smaller element gives a denser cage',
+          fine['stats']['cage_quads'] > coarse['stats']['cage_quads'],
+          '%d vs %d' % (fine['stats']['cage_quads'],
+                        coarse['stats']['cage_quads']))
+    check('and a closer fit',
+          fine['stats']['surf_to_mesh_rms_mm']
+          < coarse['stats']['surf_to_mesh_rms_mm'],
+          '%.4f vs %.4f' % (fine['stats']['surf_to_mesh_rms_mm'],
+                            coarse['stats']['surf_to_mesh_rms_mm']))
+
 print()
 if FAILED:
     print('%d FAILED: %s' % (len(FAILED), ', '.join(FAILED)))

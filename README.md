@@ -48,6 +48,7 @@ Every figure below was measured inside Fusion against the source mesh.
 | capsule (engine) | NURBS | 0.121 mm | 0.021 mm | — | −0.01% | 6 |
 | calcaneus scan, 1063 mm diagonal | Form | 12.7 mm | 1.14 mm | 1.92 mm | −0.23% | 6 |
 | calcaneus scan | NURBS | 12.9 mm | 0.87 mm | 1.28 mm | −0.13% | 6 |
+| distal radius scan, 185 mm diagonal | quad cage, 2 mm | 0.16 mm | 0.020 mm | 0.043 mm | −0.10% | 3702 |
 
 A cage of radius 2.0 emitted as TSM produced a body **32.9146 mm** across; the
 Catmull-Clark limit maths predicts **32.9146 mm**. A fitted 30 mm sphere came back
@@ -99,9 +100,9 @@ pip install numpy scipy trimesh pyvista
 ```
 
 `pyvista` is needed by the Wrap tool (VTK marching cubes and exact
-point-to-surface distance). The **quad cage** method additionally needs
-`pip install gmsh`; without it that one method is simply absent from the
-list and everything else works.
+point-to-surface distance) and by the **quad cage** method's default cage. Only
+the quad cage's *gmsh* cage source needs `pip install gmsh`; without it the
+method still works, from the scan cage.
 
 The add-in finds an interpreter automatically — the `MESHTOPART_PYTHON`
 environment variable, a `python_path.txt` beside the add-in, the usual install
@@ -120,6 +121,53 @@ lifted out of them. From there the two methods diverge:
   squares; every shared cube edge is fitted **once** from the row of cage points
   both patches share, so the body is watertight by construction rather than by
   tolerance. `BRepBodyDefinition` assembles 8 vertices, 12 edges and 6 faces.
+
+### The quad cage, and where its cage comes from
+
+The **quad cage** method does not stretch a cube onto the scan at all. It builds a
+cage at a prescribed element size, so element size is the input and the count
+follows — which is what lets it hold an edge-length ratio on anatomy where a fixed
+grid cannot. There are two sources, chosen in the dialog:
+
+**From the scan** (the default). Decimate the scan to the triangle count that lands
+the quad edge on the requested size, then quadrangulate: every triangle becomes
+three quads through its edge midpoints and its centroid. All three kinds of vertex
+lie on the decimated surface, so the cage cannot wander off the scan, and density is
+a *count* — exact and monotone. Needs nothing but numpy, scipy, trimesh and pyvista.
+
+**gmsh remesh.** `classifySurfaces` + `createGeometry` + recombination. The elements
+are tidier — rows of quads, edge ratio p95 2.7 against the scan cage's 5.7 — but the
+cage comes out of a global reparametrisation of the scan, and on a bone that
+parametrisation is distorted enough to lose whole features. Measured on a distal
+radius: the cage sat 6 mm off the surface, 11.8% short on volume, with the scan up
+to 11.3 mm from the cage that was supposed to cover it. Asking for finer elements
+made it *worse*, because a finer mesh in a distorted parameter space only resolves
+the distortion. So the cage is now checked — mesh→cage, not cage→mesh, because
+cage→mesh stays small even when the cage has shrunk past a protrusion — and if it
+is more than one element away the tool says so and falls back to the scan cage.
+
+| distal radius, 2 mm element | max | p99 | rms | volume | cage cover p99 |
+|---|---|---|---|---|---|
+| scan cage | 0.16 mm | 0.066 mm | 0.020 mm | −0.10% | 0.17 mm |
+| gmsh cage (8 mm, its best) | 1.14 mm | 0.20 mm | 0.046 mm | −0.29% | 1.16 mm |
+| gmsh cage (3 mm) | 12.6 mm | — | 0.103 mm | −10.0% | 9.7 mm |
+
+The trade is element shape: quadrangulating a triangle leaves a valence-3 star at
+every centroid, and in an obtuse triangle the centroid sits close to the long edge's
+midpoint, which makes a 45:1 quad. Those are collapsed against a floor of a quarter
+of the element — a quad that loses a corner becomes a triangle, which both the TSM
+writer and the limit operator take — bringing the worst ratio to about 13:1 for
+0.03 mm of accuracy. T-Splines take star points in their stride; Fusion built every
+cage tried here, up to 6132 quads.
+
+Because a cage may now carry triangles, the Catmull-Clark machinery is general:
+`subdivision_matrix` is one CC step for faces of any arity, expressed as a sparse
+operator so the cage can be *subdivided* (to measure) and *composed into the limit
+operator* (to fit) from a single definition. The closed-form limit mask
+`(n²P + 4Σadj + Σdiag) / (n(n+5))` holds only on an all-quad cage — a triangle has
+no opposite corner — so a mixed cage takes the quad mask on the once-refined cage
+instead. All-quad cages still take the closed form exactly, so the cube-sphere
+numbers above are unchanged.
 
 Full write-up, including what went wrong and what each mistake cost:
 [docs/ORGANIC.md](docs/ORGANIC.md).
@@ -175,9 +223,13 @@ Off by default. Nothing in normal operation depends on it.
 - The mesh-convert API is flagged *preview* by Autodesk; its enums can change.
 - A Form body needs a **parametric** design. In a direct-modelling design the tool
   says so and points you at Organic NURBS instead.
-- A finer cage follows a scan better but is likelier to self-intersect, which
-  Fusion refuses outright. The Form ladder therefore steps *down* until a cage is
-  accepted, and the report names the one it used.
+- A finer cube-sphere cage follows a scan better but is likelier to
+  self-intersect, which Fusion refuses outright. The Form ladder therefore steps
+  *down* until a cage is accepted, and the report names the one it used. The quad
+  cage does not have this problem: no cage tried on a scan has folded.
+- The quad cage's elements are accurate but not tidy. If you intend to sculpt the
+  result by hand rather than just have a solid, the gmsh cage is worth trying
+  first — the report will tell you if it lost anything.
 - Preparation (weld, boundary walk) is pure Python inside Fusion — roughly 0.03 s
   per 10 k triangles. The organic fit is the slow part: cage 20 ≈ 30 s,
   cage 32 ≈ 70 s.

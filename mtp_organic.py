@@ -1093,71 +1093,122 @@ def neighbours_from_quads(n_verts, quads):
     return tab
 
 
-def catmull_clark(points, quads):
-    """One Catmull-Clark subdivision step on a closed quad mesh.
+def subdivision_matrix(n_verts, faces):
+    """One Catmull-Clark step as a sparse operator, for faces of ANY arity.
+
+    Returned as a matrix rather than as moved points because the same step has
+    to be applied to the cage (to measure) and composed into the limit operator
+    (to fit). Doing it once, linearly, keeps those two definitions identical.
+
+    Arity matters because a gmsh cage is not all quads: recombination leaves a
+    few hundred triangles on anatomy, and the quad-only version silently dropped
+    them. That left holes in the surface being measured and vertices with no
+    neighbours at all, which is where the limit formula divided by zero.
+
+    Output faces are always quads - one CC step quadrangulates anything - so
+    everything downstream of the first level may assume quads again.
+
+    Returns (S, new_faces), S of shape (n_new, n_verts); new points are
+    S @ points. New vertices are ordered originals, then face points in face
+    order, then edge points in first-seen edge order.
+    """
+    from scipy.sparse import coo_matrix
+    rows, cols, data = [], [], []
+
+    for f, q in enumerate(faces):
+        w = 1.0 / len(q)
+        for i in q:
+            rows.append(n_verts + f)
+            cols.append(i)
+            data.append(w)
+
+    edge_faces = {}
+    for f, q in enumerate(faces):
+        n = len(q)
+        for k in range(n):
+            u, v = q[k], q[(k + 1) % n]
+            key = (u, v) if u < v else (v, u)
+            edge_faces.setdefault(key, []).append(f)
+
+    base_e = n_verts + len(faces)
+    edge_pt = {}
+    for e, (key, fs) in enumerate(edge_faces.items()):
+        u, v = key
+        r = base_e + e
+        edge_pt[key] = r
+        w = 1.0 / (2.0 + len(fs))
+        rows.extend((r, r))
+        cols.extend((u, v))
+        data.extend((w, w))
+        for f in fs:
+            fw = w / len(faces[f])          # the face point, in terms of originals
+            for i in faces[f]:
+                rows.append(r)
+                cols.append(i)
+                data.append(fw)
+
+    # the originals move: (F + 2R + (n-3) P) / n, F and R averaged over the
+    # incident faces and edges. On a closed manifold #faces == #edges == n.
+    val = np.zeros(n_verts)
+    for key in edge_faces:
+        val[key[0]] += 1
+        val[key[1]] += 1
+    nv = np.maximum(val, 1.0)
+
+    for q in faces:
+        fw = 1.0 / len(q)
+        for i in q:
+            c = fw / (nv[i] * nv[i])             # F/n, then the outer /n
+            for j in q:
+                rows.append(i)
+                cols.append(j)
+                data.append(c)
+    for u, v in edge_faces:
+        for i in (u, v):
+            # 2 * (sum of midpoints / n), then the outer / n; the midpoint
+            # itself is (P_u + P_v)/2, so the 2 and the 1/2 cancel
+            c = 1.0 / (nv[i] * nv[i])
+            rows.extend((i, i))
+            cols.extend((u, v))
+            data.extend((c, c))
+    for i in range(n_verts):
+        rows.append(i)
+        cols.append(i)
+        data.append((nv[i] - 3.0) / nv[i])
+
+    S = coo_matrix((data, (rows, cols)),
+                   shape=(base_e + len(edge_faces), n_verts)).tocsr()
+
+    new_faces = []
+    for f, q in enumerate(faces):
+        fp = n_verts + f
+        n = len(q)
+        for k in range(n):
+            u = q[k]
+            pu, nu = q[k - 1], q[(k + 1) % n]
+            prev_key = (pu, u) if pu < u else (u, pu)
+            next_key = (u, nu) if u < nu else (nu, u)
+            new_faces.append((u, edge_pt[next_key], fp, edge_pt[prev_key]))
+    return S, new_faces
+
+
+def catmull_clark(points, faces):
+    """One Catmull-Clark subdivision step on a closed mesh of any face arity.
 
     Needed to measure the Form output honestly: a T-Spline body is the limit
     surface of its control cage, so the cage itself is not what has to match the
     scan. Subdividing twice and taking limit points gives a dense, faithful
     sample of the surface Fusion will actually build.
     """
-    pts = list(points)
-    face_pt = {}
-    for f, q in enumerate(quads):
-        face_pt[f] = len(pts)
-        pts.append(sum(points[i] for i in q) / 4.0)
-
-    edge_faces = {}
-    for f, q in enumerate(quads):
-        for k in range(4):
-            u, v = q[k], q[(k + 1) % 4]
-            key = (u, v) if u < v else (v, u)
-            edge_faces.setdefault(key, []).append(f)
-
-    edge_pt = {}
-    for key, fs in edge_faces.items():
-        u, v = key
-        acc = points[u] + points[v]
-        for f in fs:
-            acc = acc + pts[face_pt[f]]
-        edge_pt[key] = len(pts)
-        pts.append(acc / (2.0 + len(fs)))
-
-    # move the originals
-    n_orig = len(points)
-    F_acc = np.zeros((n_orig, 3))
-    R_acc = np.zeros((n_orig, 3))
-    val = np.zeros(n_orig)
-    for f, q in enumerate(quads):
-        for i in q:
-            F_acc[i] += pts[face_pt[f]]
-    for key, fs in edge_faces.items():
-        u, v = key
-        mid = 0.5 * (points[u] + points[v])
-        R_acc[u] += mid
-        R_acc[v] += mid
-        val[u] += 1
-        val[v] += 1
-    n = np.maximum(val, 1)[:, None]
-    moved = (F_acc / n + 2.0 * (R_acc / n) + (n - 3.0) * points) / n
-
-    new_pts = np.array(pts)
-    new_pts[:n_orig] = moved
-
-    new_quads = []
-    for f, q in enumerate(quads):
-        fp = face_pt[f]
-        for k in range(4):
-            u = q[k]
-            prev_key = (q[k - 1], u) if q[k - 1] < u else (u, q[k - 1])
-            next_key = (u, q[(k + 1) % 4]) if u < q[(k + 1) % 4] else (q[(k + 1) % 4], u)
-            new_quads.append((u, edge_pt[next_key], fp, edge_pt[prev_key]))
-    return new_pts, new_quads
+    S, new_faces = subdivision_matrix(len(points), faces)
+    return S @ np.asarray(points, float), new_faces
 
 
 def limit_surface_mesh(points, quads, levels=2):
     """Dense triangle mesh of the T-Spline limit surface, for measurement."""
-    p, q = np.asarray(points, float), list(quads)
+    p, q = np.asarray(points, float), [tuple(f) for f in quads]
+    if any(len(f) != 4 for f in q):
+        levels = max(1, levels)     # one step quadrangulates; the rest assume it
     for _ in range(levels):
         p, q = catmull_clark(p, q)
     tab = neighbours_from_quads(len(p), q)
@@ -1210,6 +1261,32 @@ def limit_matrix(n_verts, quads_arr, table):
     return (diags(1.0 / rs) @ M).tocsc()
 
 
+def limit_operator(n_verts, faces):
+    """Catmull-Clark limit operator for a cage of ANY face arity.
+
+    The closed-form mask (n^2 P + 4 sum_adj + sum_diag) / (n(n+5)) holds only on
+    an all-quad cage: a triangle has no opposite corner, so the diagonal term is
+    simply missing and row-normalising it back to 1 is a guess, not the limit.
+    One subdivision step quadrangulates anything, and subdividing does not move
+    the limit surface, so the honest operator is the quad mask on the once-refined
+    cage composed with the subdivision itself.
+
+    All-quad cages take the direct path unchanged, so the cube-sphere numbers
+    stay exactly what they were.
+    """
+    faces = [tuple(f) for f in faces]
+    if all(len(f) == 4 for f in faces):
+        table = neighbours_from_quads(n_verts, faces)
+        qa = tuple(np.array([f[k] for f in faces], np.int64) for k in range(4))
+        return limit_matrix(n_verts, qa, table)
+
+    S, ref = subdivision_matrix(n_verts, faces)
+    tab2 = neighbours_from_quads(S.shape[0], ref)
+    qa2 = tuple(np.array([f[k] for f in ref], np.int64) for k in range(4))
+    Lq = limit_matrix(S.shape[0], qa2, tab2)
+    return (Lq[:n_verts, :] @ S).tocsc()
+
+
 def graph_laplacian(n_verts, table):
     """Uniform graph Laplacian of the cage, used to keep the control net tame."""
     from scipy.sparse import coo_matrix
@@ -1229,7 +1306,8 @@ def graph_laplacian(n_verts, table):
                       shape=(n_verts, n_verts)).tocsc()
 
 
-def fit_limit_to_mesh(points, quads_arr, table, proj, iters, lam=1.0e-3, log=None):
+def fit_limit_to_mesh(points, quads_arr, table, proj, iters, lam=1.0e-3, log=None,
+                      faces=None):
     """Solve for the control cage whose LIMIT surface sits on the mesh.
 
     A T-Spline body is the limit surface of its cage, and a subdivision surface
@@ -1246,7 +1324,8 @@ def fit_limit_to_mesh(points, quads_arr, table, proj, iters, lam=1.0e-3, log=Non
     keeps the net tame; the caller raises lam until no quad is folded.
     """
     from scipy.sparse.linalg import spsolve
-    L = limit_matrix(len(points), quads_arr, table)
+    L = (limit_matrix(len(points), quads_arr, table) if faces is None
+         else limit_operator(len(points), faces))
     D = graph_laplacian(len(points), table)
     A = (L.T @ L + lam * (D.T @ D)).tocsc()
     for it in range(iters):
@@ -1296,7 +1375,7 @@ def untangle_cage(points, table, quads, passes, log=None):
 
 
 def fit_limit_unfolded(points, quads_arr, table, proj, iters, lam0, passes,
-                       log=None):
+                       log=None, faces=None):
     """Fit the limit surface, then clear any buckle it introduced.
 
     Solving L C = T exactly makes the control net overshoot wherever the surface
@@ -1308,7 +1387,8 @@ def fit_limit_unfolded(points, quads_arr, table, proj, iters, lam0, passes,
     best = None
     for attempt in range(5):
         pts, mx, mn = fit_limit_to_mesh(points, quads_arr, table, proj, iters,
-                                        lam=lam, log=log if attempt == 0 else None)
+                                        lam=lam, log=log if attempt == 0 else None,
+                                        faces=faces)
         pts, n_bad = untangle_cage(pts, table, quads_arr, passes, log)
         if best is None or n_bad < best[3]:
             best = (pts, mx, mn, n_bad, lam)
@@ -1424,7 +1504,7 @@ def collapse_short_edges(pts, faces, floor, log):
             counts[key] = counts.get(key, 0) + 1
     if any(c != 2 for c in counts.values()) or len(new_faces) < 4:
         log('  edge floor %.2f mm abandoned: the collapse broke the manifold'
-            % (floor * 10.0))
+            % floor)
         return pts, faces
     used = {v for f in new_faces for v in f}
     if len(used) != len(new_pts):
@@ -1433,8 +1513,154 @@ def collapse_short_edges(pts, faces, floor, log):
         new_faces = [tuple(remap[v] for v in f) for f in new_faces]
     log('  edge floor %.2f mm: %d short edges collapsed, %d -> %d vertices, '
         '%d -> %d faces'
-        % (floor * 10.0, short, len(pts), len(new_pts), len(faces), len(new_faces)))
+        % (floor, short, len(pts), len(new_pts), len(faces), len(new_faces)))
     return new_pts, new_faces
+
+
+def quadrangulate(points, faces):
+    """Topological Catmull-Clark step: an n-gon becomes n quads, nothing moves.
+
+    The subdivision rules are deliberately NOT applied. A face point is the
+    centroid of its corners and an edge point is the midpoint of its ends, so
+    every new vertex lies in the plane of a face it came from - the cage is on
+    the surface by construction rather than by projection.
+    """
+    pts = list(np.asarray(points, float))
+    face_pt = []
+    for f in faces:
+        face_pt.append(len(pts))
+        pts.append(np.asarray([points[i] for i in f], float).mean(axis=0))
+
+    edge_pt = {}
+    for f in faces:
+        n = len(f)
+        for k in range(n):
+            a, b = int(f[k]), int(f[(k + 1) % n])
+            key = (a, b) if a < b else (b, a)
+            if key not in edge_pt:
+                edge_pt[key] = len(pts)
+                pts.append(0.5 * (points[a] + points[b]))
+
+    quads = []
+    for i, f in enumerate(faces):
+        n = len(f)
+        fp = face_pt[i]
+        for k in range(n):
+            u = int(f[k])
+            pu, nu = int(f[k - 1]), int(f[(k + 1) % n])
+            pk = (pu, u) if pu < u else (u, pu)
+            nk = (u, nu) if u < nu else (nu, u)
+            quads.append((u, edge_pt[nk], fp, edge_pt[pk]))
+    return np.array(pts), quads
+
+
+def cage_coverage(points, faces, mesh, samples=40000):
+    """How far the scan is from the cage - the check gmsh's cage needed.
+
+    The fit that follows moves control points; it cannot invent topology. So a
+    cage that does not lie over a part of the scan produces a body missing that
+    part, and no amount of fitting recovers it. Measuring mesh->cage (not the
+    reverse) is what catches that: cage->mesh stays small even when the cage has
+    shrunk past a protrusion, because every cage point is still near SOME bit of
+    bone.
+    """
+    tri = []
+    for f in faces:
+        tri.append((f[0], f[1], f[2]))
+        for k in range(3, len(f)):
+            tri.append((f[0], f[k - 1], f[k]))
+    cage = trimesh.Trimesh(vertices=np.asarray(points, float),
+                           faces=np.array(tri, np.int64), process=False)
+    probe, _fi = trimesh.sample.sample_surface(mesh, int(samples))
+    probe = np.vstack([probe, mesh.vertices])
+    _c, d, _f = Projector(cage)(probe, k=16, exact=False)
+    return {'max_mm': float(d.max() * 10.0),
+            'p99_mm': float(np.percentile(d, 99) * 10.0),
+            'volume_pct': float(100.0 * (cage.volume - mesh.volume) / mesh.volume)}
+
+
+def scan_quad_cage(mesh, job, log):
+    """An all-quad cage taken straight off the scan. Points in CENTIMETRES.
+
+    gmsh's cage comes from a global reparametrisation of the scan, and on a bone
+    that parametrisation is so distorted that the cage wanders off the surface -
+    measured here at 6 mm away and 11.8% short on volume, with the scan up to
+    11.3 mm from the cage it was supposed to sit on. Asking for finer elements
+    made it worse, not better, because a finer mesh in a distorted parameter
+    space just resolves the distortion.
+
+    This route never leaves the scan: decimate it to the triangle count that
+    gives the requested element size, then quadrangulate. Each triangle becomes
+    three quads whose vertices are its corners, edge midpoints and centroid, all
+    on the decimated surface. Density is a COUNT, so it is exact and monotone,
+    and the cage is watertight whenever the decimation is.
+
+    The trade is element shape: a quadrangulated triangle leaves a valence-3 star
+    at every centroid, where gmsh's recombination gives cleaner rows. T-Splines
+    take star points in their stride, and the cage may be relaxed afterwards.
+    """
+    import pyvista as pv
+
+    h = float(job.get('hmax_mm', 8.0))
+    cap = int(job.get('cage_quad_cap', 24000))
+    area_mm2 = float(mesh.area) * 100.0
+
+    # a triangle of edge L quadrangulates into quads of edge about L/2, and
+    # F triangles over area A have L = sqrt(4A / (sqrt(3) F)); solving for the
+    # count that lands the QUAD edge on h. Measured against the achieved median
+    # edge on this scan it is within 6%.
+    target = int(round(area_mm2 / (math.sqrt(3.0) * h * h)))
+    target = max(40, min(target, cap // 3))
+
+    v_mm = np.asarray(mesh.vertices, float) * 10.0
+    f = np.asarray(mesh.faces)
+    pd = pv.PolyData(v_mm, np.hstack([np.full((len(f), 1), 3), f]).ravel())
+    if target < len(f):
+        dec = pd.decimate(1.0 - float(target) / len(f), volume_preservation=True)
+        dec = dec.clean().triangulate()
+    else:
+        dec = pd.clean().triangulate()
+    vd = np.asarray(dec.points, float)
+    fd = np.asarray(dec.faces).reshape(-1, 4)[:, 1:]
+
+    base = trimesh.Trimesh(vertices=vd, faces=fd, process=True)
+    if not base.is_watertight:
+        base.merge_vertices()
+    if not base.is_watertight:
+        raise RuntimeError('decimating the scan to %d triangles left it open; '
+                           'ask for a larger element' % target)
+    base.fix_normals()
+    vd = np.asarray(base.vertices, float)
+    fd = [tuple(int(x) for x in t) for t in np.asarray(base.faces)]
+
+    pts, quads = quadrangulate(vd, fd)
+
+    # A quadrangulated triangle inherits its shape: in an obtuse triangle the
+    # centroid sits close to the long edge's midpoint, and the quad between them
+    # comes out 45:1. The decimated TRIANGLES are fine (ratio max 7.7, shortest
+    # edge 0.9 mm) - it is the quadrangulation that makes the slivers, so this is
+    # the place to collapse them. A quad that loses a corner becomes a triangle,
+    # which the TSM writer and the limit operator both take.
+    floor = float(job.get('cage_edge_floor', 0.25)) * h
+    if floor > 0.0:
+        pts, quads = collapse_short_edges(pts, quads, floor, log)
+
+    quads = orient_faces(quads)
+    tri = []
+    for q in quads:
+        for k in range(2, len(q)):
+            tri.append((q[0], q[k - 1], q[k]))
+    if trimesh.Trimesh(vertices=pts, faces=np.array(tri),
+                       process=False).volume < 0:
+        quads = [tuple(reversed(q)) for q in quads]
+
+    qs = np.array([q for q in quads if len(q) == 4], np.int64)
+    L = edge_lengths(pts, (qs[:, 0], qs[:, 1], qs[:, 2], qs[:, 3]))
+    nq = len(qs)
+    log('  scan cage: %d quads + %d triangles from %d decimated triangles, '
+        '%d vertices (element %.2f mm asked, %.2f mm median)'
+        % (nq, len(quads) - nq, len(fd), len(pts), h, float(np.median(L))))
+    return pts * 0.1, quads          # mm -> cm
 
 
 def gmsh_cage(mesh, job, log):
@@ -1545,23 +1771,59 @@ def build(job, log):
     m = n + 1
     cage_faces = None
     grids = None
+    cage_source_used = None
+    cage_cover = None
 
-    if job.get('cage_source') == 'gmsh':
+    if job.get('cage_source') in ('gmsh', 'scan'):
         if job.get('output') != 'tsm':
             raise RuntimeError('the quad cage is a Form (T-Spline) cage; '
                                'the NURBS path needs the cube-sphere')
-        points, cage_faces = gmsh_cage(mesh, job, log)
+        source = job['cage_source']
+        h = float(job.get('hmax_mm', 8.0))
+        if source == 'gmsh':
+            points, cage_faces = gmsh_cage(mesh, job, log)
+            cover = cage_coverage(points, cage_faces, mesh)
+            log('  cage covers the scan to max %.3f p99 %.3f mm, volume %+.2f %%'
+                % (cover['max_mm'], cover['p99_mm'], cover['volume_pct']))
+            # a control cage that does not lie OVER a part of the scan cannot be
+            # fitted onto it later - the fit moves points, not topology. One
+            # element of slack is generous; beyond that the cage has lost
+            # something and a finer one loses more, so change route instead.
+            if (cover['p99_mm'] > float(job.get('coverage_slack', 1.0)) * h
+                    and job.get('cage_fallback', True)):
+                log('  that is more than one element away: gmsh\'s '
+                    'reparametrisation has lost part of the scan, '
+                    'falling back to the scan-derived cage')
+                source = 'scan'
+        if source == 'scan':
+            points, cage_faces = scan_quad_cage(mesh, job, log)
+            cover = cage_coverage(points, cage_faces, mesh)
+            log('  cage covers the scan to max %.3f p99 %.3f mm, volume %+.2f %%'
+                % (cover['max_mm'], cover['p99_mm'], cover['volume_pct']))
+        cage_source_used = source
+        cage_cover = cover
         proj = Projector(mesh)
         table = neighbours_from_quads(len(points), cage_faces)
         qs = np.array([f for f in cage_faces if len(f) == 4], np.int64)
         qa = (qs[:, 0].copy(), qs[:, 1].copy(), qs[:, 2].copy(), qs[:, 3].copy())
         quads = [list(f) for f in cage_faces if len(f) == 4]
         cage_folds = 0
-        # no shrink wrap and no relaxation: the cage is generated ON the
-        # mesh at a prescribed element size, which is the point of using
-        # a mesher instead of deforming a sphere onto the surface
-        cage_quality = {'after': aspect_report(
-            points, qa, float(job.get('aspect_limit', 1.2)) or 1.2)}
+        limit = float(job.get('aspect_limit', 0.0)) or 2.0
+        cage_quality = {'before': aspect_report(points, qa, limit)}
+        # No shrink wrap: the cage is already on the scan, which is the point of
+        # generating it there instead of deforming a sphere onto it. A shape
+        # relaxation is still worth having - a quadrangulated triangle leaves
+        # elongated elements - but it is tangential and fold-safe, so the cage
+        # stays on the surface.
+        n_sq = int(job.get('cage_square_iters', 0))
+        if n_sq > 0:
+            _c, _d, fid = proj(points, k=16, exact=False)
+            points, fid = relax_square(
+                points, table, qa, proj, fid, n_sq,
+                float(job.get('square_weight', 0.6)),
+                float(job.get('min_edge_mm', 0.0)) * 0.1, limit, log,
+                step_cap=float(job.get('square_step_cap', 0.10)))
+        cage_quality['after'] = aspect_report(points, qa, limit)
     else:
         verts, grids = cube_sphere(n)
         table = cage_neighbours(len(verts), grids)
@@ -1600,11 +1862,15 @@ def build(job, log):
         pts, lim_max, lim_mean, lim_folds, lam_used = fit_limit_unfolded(
             points, qa, table, proj, int(job.get('limit_iters', 20)),
             float(job.get('limit_fair', 1.0e-3)),
-            int(job.get('cage_untangle', 60)), log)
+            int(job.get('cage_untangle', 60)), log, faces=cage_faces)
         log('control cage fitted so the LIMIT surface lands on the mesh')
 
-        lim_pts, lim_tris = limit_surface_mesh(pts, quads,
-                                               int(job.get('eval_levels', 2)))
+        # the FULL face list, not the quad subset: dropping the triangles
+        # left holes in the surface being measured and vertices with no
+        # neighbours at all, which is where the limit formula produced NaN
+        lim_pts, lim_tris = limit_surface_mesh(
+            pts, cage_faces if cage_faces is not None else quads,
+            int(job.get('eval_levels', 2)))
         _c, d_out, _f = proj(lim_pts)
         surf = trimesh.Trimesh(vertices=lim_pts, faces=lim_tris, process=False)
         proj_s = Projector(surf)
@@ -1619,6 +1885,11 @@ def build(job, log):
             'cage_points': pts.tolist(),
             'stats': {
                 'output': 'tsm',
+                'cage_source': cage_source_used,
+                'cage_cover': cage_cover,
+                'cage_square_iters': int(job.get('cage_square_iters', 0)),
+                'cage_element_mm': (float(job.get('hmax_mm', 8.0))
+                                    if cage_source_used else None),
                 'cage': n,
                 'cage_verts': int(len(pts)),
                 'cage_quads': int(len(quads)),

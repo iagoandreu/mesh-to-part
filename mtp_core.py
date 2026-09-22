@@ -85,6 +85,16 @@ METHOD_BY_KEY = {k: (lab, en) for k, lab, en in METHODS}
 
 RESOLUTIONS = ['Auto from max error', 'Low', 'Medium', 'High', 'Precise', 'By face count']
 
+# key, label. The scan cage is first because it is the default: it is taken off
+# the scan itself, so it cannot wander off the surface, and a smaller element
+# always gives a better body. gmsh's is prettier - cleaner rows of quads - but
+# it comes from a global reparametrisation that on a bone loses whole features,
+# and asking it for finer elements only resolves the distortion better.
+CAGE_SOURCES = [
+    ('scan', 'From the scan (robust, any element size)'),
+    ('gmsh', 'gmsh remesh (tidier quads, needs pip install gmsh)'),
+]
+
 
 _GMSH_OK = None
 
@@ -119,8 +129,8 @@ def probe_methods(comp, mesh_body):
             ok = bool(python_cmd()) and os.path.exists(ORGANIC_ENGINE)
             why = ('' if ok else 'needs a Python with numpy, scipy and trimesh; '
                                  'see python_path.txt')
-            if ok and key == 'quad_cage' and not has_gmsh():
-                ok, why = False, 'needs gmsh in that Python: pip install gmsh'
+            # gmsh is only ONE of the two cage sources now, and not the
+            # default one, so its absence no longer removes the method
             out[key] = (ok, why)
             continue
         try:
@@ -848,40 +858,46 @@ def run_pipeline(app, src_body, o, progress=None):
 
         step('Converting: %s (%s)' % (o['method_label'].split(' (')[0], label))
         try:
-            if o['method_key'] == 'quad_cage':
-                params = {'cage_source': 'gmsh',
-                          'hmax_mm': float(rung['hmax']),
-                          'hmin_mm': float(o.get('min_edge_mm', 0.0)) or 1.0,
-                          'curvature': float(o.get('curvature', 16.0)),
-                          'aspect_limit': float(o.get('aspect_limit', 0.0)) or 1.2,
-                          'cage_input_tris': int(o.get('cage_input_tris', 20000))}
+            if o['method_key'] in ('quad_cage', 'custom_organic', 'form'):
+                if o['method_key'] == 'quad_cage':
+                    params = {'cage_source': o.get('cage_source', 'scan'),
+                              'hmax_mm': float(rung['hmax']),
+                              # gmsh's own size floor scales with the rung, or
+                              # the ladder refines nothing: the curvature field
+                              # pins the element to the floor, so holding the
+                              # floor fixed made every rung the same cage
+                              'hmin_mm': (float(o.get('min_edge_mm', 0.0))
+                                          or 0.25 * float(rung['hmax'])),
+                              'curvature': float(o.get('curvature', 16.0)),
+                              'cage_square_iters': int(o.get('cage_square_iters', 0)),
+                              'square_weight': float(o.get('square_weight', 0.6)),
+                              'aspect_limit': float(o.get('aspect_limit', 0.0)) or 2.0,
+                              'cage_input_tris': int(o.get('cage_input_tris', 20000))}
+                    builder = organic_form_body
+                else:
+                    # ctrl < cage+1 makes this a least-squares FIT; ctrl == cage+1
+                    # makes it an interpolation of every cage point. The cage sits
+                    # exactly on the mesh, so interpolating it reproduces the
+                    # mesh's own faceting as curvature ripple -- visible as pinch
+                    # lines / stripes under specular shading. Sampling densely
+                    # (cage) and fitting loosely (ctrl) is what removes them.
+                    m = rung['cage'] + 1
+                    ctrl = max(6, min(m, int(round(o.get('ctrl_ratio', 1.0) * m))))
+                    params = {'cage': rung['cage'],
+                              'wrap_iters': o['wrap_iters'],
+                              'relax_iters': o['relax_iters'],
+                              'ctrl': ctrl,
+                              'fair': o['fairness'],
+                              'aspect_limit': float(o.get('aspect_limit', 0.0)),
+                              'aspect_iters': int(o.get('aspect_iters', 0)),
+                              'aspect_gain': float(o.get('aspect_gain', 2.0)),
+                              'square_iters': int(round(o.get('square_iters', 0)
+                                                        * rung.get('square_scale', 1.0))),
+                              'square_weight': float(o.get('square_weight', 0.6)),
+                              'min_edge_mm': float(o.get('min_edge_mm', 0.0))}
+                    builder = (organic_form_body if o['method_key'] == 'form'
+                               else organic_body)
                 w = refetch() or work
-                body, eres, feat = organic_form_body(app, w, params, org_log)
-                rep['engine'] = eres['stats']
-            elif o['method_key'] in ('custom_organic', 'form'):
-                # ctrl < cage+1 makes this a least-squares FIT; ctrl == cage+1
-                # makes it an interpolation of every cage point. The cage sits
-                # exactly on the mesh, so interpolating it reproduces the
-                # mesh's own faceting as curvature ripple -- visible as pinch
-                # lines / stripes under specular shading. Sampling densely
-                # (cage) and fitting loosely (ctrl) is what removes them.
-                m = rung['cage'] + 1
-                ctrl = max(6, min(m, int(round(o.get('ctrl_ratio', 1.0) * m))))
-                params = {'cage': rung['cage'],
-                          'wrap_iters': o['wrap_iters'],
-                          'relax_iters': o['relax_iters'],
-                          'ctrl': ctrl,
-                          'fair': o['fairness'],
-                          'aspect_limit': float(o.get('aspect_limit', 0.0)),
-                          'aspect_iters': int(o.get('aspect_iters', 0)),
-                          'aspect_gain': float(o.get('aspect_gain', 2.0)),
-                          'square_iters': int(round(o.get('square_iters', 0)
-                                                    * rung.get('square_scale', 1.0))),
-                          'square_weight': float(o.get('square_weight', 0.6)),
-                          'min_edge_mm': float(o.get('min_edge_mm', 0.0))}
-                w = refetch() or work
-                builder = (organic_form_body if o['method_key'] == 'form'
-                           else organic_body)
                 body, eres, feat = builder(app, w, params, org_log)
                 rep['engine'] = eres['stats']
                 rep['attempts'].append({
@@ -1166,8 +1182,19 @@ def format_report(rep, o, secs):
         L.append('')
         L.append('  %s ENGINE' % ('ORGANIC FORM (T-SPLINE)' if form
                                   else 'ORGANIC NURBS'))
-        L.append('    cage            %d per cube face, %d points'
-                 % (e['cage'], e['cage_verts']))
+        if e.get('cage_source'):
+            L.append('    cage            %s, element %.2f mm asked, %d points'
+                     % (e['cage_source'], e.get('cage_element_mm') or 0.0,
+                        e['cage_verts']))
+            cov = e.get('cage_cover') or {}
+            if cov:
+                L.append('    cage covers     the scan to max %.3f  p99 %.3f mm'
+                         '   (volume %+.2f %%)'
+                         % (cov.get('max_mm', 0.0), cov.get('p99_mm', 0.0),
+                            cov.get('volume_pct', 0.0)))
+        else:
+            L.append('    cage            %d per cube face, %d points'
+                     % (e['cage'], e['cage_verts']))
         if form:
             L.append('    control mesh    %d quads, %d folded'
                      % (e.get('cage_quads', 0), e.get('cage_folded_quads', 0)))
@@ -1188,11 +1215,16 @@ def format_report(rep, o, secs):
             L.append('    element edges   ratio med %.2f  p95 %.2f  max %.2f'
                      '   (longest/shortest edge within one quad)'
                      % (em['ratio_median'], em['ratio_p95'], em['ratio_max']))
-            L.append('    %d of %d emitted elements exceed the ratio limit %.2f'
-                     % (em['over_limit'], em['quads'], em['limit']))
+            if e.get('cage_square_iters'):
+                L.append('    %d of %d emitted elements over the ratio limit %.2f'
+                         % (em['over_limit'], em['quads'], em['limit']))
+            else:
+                L.append('    shortest edge %.3f mm; element shape is not'
+                         ' relaxed, and does not affect accuracy'
+                         % em['min_edge_mm'])
             L.append('    edge length     shortest %.3f  median %.3f mm'
                      % (em['min_edge_mm'], em['median_edge_mm']))
-        if q and q.get('after'):
+        if q and q.get('after') and not q.get('emitted'):
             aft = q['after']
             bef = q.get('before')
             L.append('    element edges   ratio med %.2f  p95 %.2f  max %.2f'
@@ -1202,7 +1234,7 @@ def format_report(rep, o, secs):
                          '   (limit %.2f)'
                          % (bef['ratio_median'], bef['ratio_p95'],
                             bef['ratio_max'], aft['limit']))
-            L.append('    %d of %d elements still exceed the ratio limit'
+            L.append('    %d of %d elements over the ratio limit'
                      % (aft['over_limit'], aft['quads']))
         if e.get('signed_volume_mm3'):
             L.append('    closed volume   %.1f vs mesh %.1f mm3  (%+.3f %%)'
@@ -1283,7 +1315,7 @@ DEFAULTS = {
     'ctrlRatio': 0.5, 'wrapOffset': 0.0, 'wrapClose': 0.0,
     'aspectLimit': 1.2, 'aspectPasses': 80,
     'squarePasses': 120, 'minEdge': 1.5, 'smoothPasses': 0,
-    'quadSize': 8.0, 'quadCurv': 16,
+    'quadSize': 2.0, 'quadCurv': 16, 'cageSource': 0,
     'cageAuto': True,
     'fallbackFaceted': True,
 }
@@ -1371,6 +1403,11 @@ def build_inputs(inputs, s):
     c.addFloatSpinnerCommandInput(
         'ctrlRatio', 'Organic: control net / cage (NURBS only)', '',
         0.2, 1.0, 0.05, float(s['ctrlRatio']))
+    cs = c.addDropDownCommandInput('cageSource', 'Quad cage: cage from',
+                                   adsk.core.DropDownStyles
+                                   .TextListDropDownStyle)
+    for i, lab in enumerate(CAGE_SOURCES):
+        cs.listItems.add(lab[1], i == int(s.get('cageSource', 0)))
     c.addValueInput('quadSize', 'Quad cage: target element size', 'mm',
                     adsk.core.ValueInput.createByReal(float(s['quadSize']) * MM))
     c.addIntegerSpinnerCommandInput('quadCurv',
@@ -1484,15 +1521,20 @@ def refresh_visibility(inputs):
                 'aspectLimit', 'aspectPasses', 'squarePasses', 'minEdge'):
         inputs.itemById(cid).isVisible = custom
     quadc = (key == 'quad_cage')
-    for cid in ('quadSize', 'quadCurv'):
+    for cid in ('quadSize', 'cageSource'):
         inputs.itemById(cid).isVisible = quadc
+    gmsh_cage = quadc and CAGE_SOURCES[
+        inputs.itemById('cageSource').selectedItem.index][0] == 'gmsh'
+    # the curvature field and the size floor are gmsh's; the scan cage takes a
+    # triangle count derived from the element size and has nothing to feed them
+    inputs.itemById('quadCurv').isVisible = gmsh_cage
     if quadc:
         # the cube-sphere controls mean nothing to a size-driven cage
         for cid in ('cageAuto', 'cage', 'fairness', 'relaxIters', 'ctrlRatio',
                     'aspectPasses', 'squarePasses'):
             inputs.itemById(cid).isVisible = False
-        for cid in ('minEdge', 'aspectLimit'):
-            inputs.itemById(cid).isVisible = True
+        inputs.itemById('minEdge').isVisible = gmsh_cage
+        inputs.itemById('aspectLimit').isVisible = True
     inputs.itemById('cage').isVisible = custom and not inputs.itemById('cageAuto').value
     inputs.itemById('preprocessHoles').isVisible = organic
     inputs.itemById('escalate').isVisible = not by_count
@@ -1539,6 +1581,8 @@ def resolve_options(inputs):
         'square_iters': inputs.itemById('squarePasses').value,
         'quad_size_mm': inputs.itemById('quadSize').value * CM,
         'curvature': inputs.itemById('quadCurv').value,
+        'cage_source': CAGE_SOURCES[
+            inputs.itemById('cageSource').selectedItem.index][0],
         'min_edge_mm': inputs.itemById('minEdge').value * CM,
         'smooth_iters': inputs.itemById('smoothPasses').value,
         'aspect_iters': inputs.itemById('aspectPasses').value,
@@ -1587,6 +1631,7 @@ def settings_from(inputs):
         'squarePasses': inputs.itemById('squarePasses').value,
         'quadSize': inputs.itemById('quadSize').value * CM,
         'quadCurv': inputs.itemById('quadCurv').value,
+        'cageSource': inputs.itemById('cageSource').selectedItem.index,
         'minEdge': inputs.itemById('minEdge').value * CM,
         'smoothPasses': inputs.itemById('smoothPasses').value,
         'aspectPasses': inputs.itemById('aspectPasses').value,
@@ -2081,6 +2126,7 @@ def dev_options(over):
         'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
         'aspect_limit': 1.2, 'aspect_iters': 80, 'aspect_gain': 2.0,
         'quad_size_mm': 8.0, 'curvature': 16.0, 'cage_input_tris': 20000,
+        'cage_source': 'scan', 'cage_square_iters': 0,
         'square_iters': 120, 'square_weight': 0.6, 'min_edge_mm': 0.0,
         'smooth_iters': 0, 'smooth_band': 0.1,
         'wrap_iters': 50, 'relax_iters': 70,
