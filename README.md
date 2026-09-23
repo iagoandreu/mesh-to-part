@@ -58,6 +58,41 @@ On the calcaneus, judge by p95/RMS. The max sits at a handful of isolated 150°
 creases in a mesh whose mean edge length is 15.7 mm — no smooth surface reproduces
 those, and Fusion's own Organic conversion would round them too.
 
+## Auto
+
+A button at the top of the dialog: **Auto: choose settings for this mesh**. It
+measures the mesh and writes the settings into the dialog — it converts nothing,
+so everything it picks is there to be overridden before you press OK.
+
+What it measures, and what each measurement decides:
+
+- **Open boundaries and their spans** → gap filling on or off, and the limit set
+  just above the widest gap.
+- **Normal consistency** → stitch-and-remove-artifacts, or no repair.
+- **The dihedral angle across every shared edge** → machined or organic. What
+  separates them is not flatness alone (a cube is only a third coplanar, because
+  its other edges are 90° creases) but that every edge is *either* flat *or* a
+  crisp crease: 100% decided for a cube against 19% for a distal radius scan.
+  Machined goes to Prismatic, organic to the quad cage.
+- **The candidate cages themselves** → the element size. The cage is the cheap
+  half of the pipeline — about 0.2 s against 8–27 s for the fit — so Auto builds
+  six or seven of them across the useful range and measures each against the
+  scan, rather than inverting a formula. It then takes the *coarsest* whose own
+  worst deviation is already inside the budget.
+
+Measured on a distal radius over 8.0 down to 1.2 mm, the final worst-of-both-
+directions deviation came out at 0.44–0.53 × the cage's own worst, so the cage
+figure is used directly and roughly a factor of two is left in hand. That margin
+is deserved: the **rms** falls as a clean power law in element size
+(`0.0070 h^1.56` mm on that scan) but the **worst single point** does not fall
+monotonically at all — it is set by isolated spots on the scan, not by the cage.
+So Auto also turns escalation on, and the ladder measures its way down if the
+prediction was optimistic.
+
+The ladder stops where the cage would exceed about 16 000 quads, because that is
+cost rather than accuracy running out. When the budget is unreachable within that
+cap, Auto says so instead of pretending.
+
 ## Wrap (offset)
 
 A second command, in **Mesh -> Modify** and **Solid -> Modify**. It grows or

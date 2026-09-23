@@ -1554,7 +1554,7 @@ def quadrangulate(points, faces):
     return np.array(pts), quads
 
 
-def cage_coverage(points, faces, mesh, samples=40000):
+def cage_coverage(points, faces, mesh, samples=40000, seed=20260922):
     """How far the scan is from the cage - the check gmsh's cage needed.
 
     The fit that follows moves control points; it cannot invent topology. So a
@@ -1571,7 +1571,9 @@ def cage_coverage(points, faces, mesh, samples=40000):
             tri.append((f[0], f[k - 1], f[k]))
     cage = trimesh.Trimesh(vertices=np.asarray(points, float),
                            faces=np.array(tri, np.int64), process=False)
-    probe, _fi = trimesh.sample.sample_surface(mesh, int(samples))
+    # seeded: Auto probes the same cages twice in a session and a wandering
+    # answer would read as flakiness rather than as sampling noise
+    probe, _fi = trimesh.sample.sample_surface(mesh, int(samples), seed=seed)
     probe = np.vstack([probe, mesh.vertices])
     _c, d, _f = Projector(cage)(probe, k=16, exact=False)
     return {'max_mm': float(d.max() * 10.0),
@@ -1757,6 +1759,52 @@ def gmsh_cage(mesh, job, log):
     log('  gmsh cage: %d quads + %d triangles, %d vertices (size %.1f-%.1f mm, '
         'curvature %d)' % (nq, len(faces) - nq, len(pts), hmin, hmax, int(curv)))
     return pts * 0.1, faces          # mm -> cm
+
+
+def probe_cages(job, log):
+    """Build cages at several element sizes and measure them, without fitting.
+
+    The fit is the expensive part - 8 to 27 s on a distal radius - and the cage
+    is not: 0.2 s once the imports are warm. So the way to choose an element size
+    is to build the cages and look at them, rather than to guess from a formula
+    and then discover the answer twenty seconds later.
+
+    What is reported is mesh->cage, because that is the half that says whether
+    the cage has lost a feature; see cage_coverage. Measured against the fitted
+    result on a distal radius over 8.0 to 1.2 mm, the final worst-of-both-
+    directions deviation came out at 0.44 to 0.53 times the cage's own max for
+    every size where the fit behaved, so half the cage max is the working
+    prediction and the cage max itself is the conservative one.
+    """
+    coords = np.array(job['coords'], float).reshape(-1, 3)
+    faces = np.array(job['idx'], np.int64).reshape(-1, 3)
+    mesh = trimesh.Trimesh(vertices=coords, faces=faces, process=True)
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) * 10.0
+    out = []
+    for h in job['probe']:
+        row = {'element_mm': float(h)}
+        try:
+            pts, cf = scan_quad_cage(mesh, dict(job, hmax_mm=float(h)),
+                                     lambda m: None)
+            cov = cage_coverage(pts, cf, mesh,
+                                samples=int(job.get('probe_samples', 20000)))
+            row.update(cov)
+            row['quads'] = int(sum(1 for f in cf if len(f) == 4))
+            row['vertices'] = int(len(pts))
+            # what the fit is expected to land on, and the pessimistic reading
+            row['predicted_mm'] = 0.5 * cov['max_mm']
+            row['pessimistic_mm'] = cov['max_mm']
+        except Exception as exc:
+            row['error'] = '%s: %s' % (type(exc).__name__, exc)
+        out.append(row)
+        log('  element %5.2f mm -> %s' % (h, row.get('error') or
+            'cage max %.3f p99 %.3f mm, %d quads'
+            % (row['max_mm'], row['p99_mm'], row['quads'])))
+    return {'probe': out, 'diagonal_mm': diag,
+            'triangles': int(len(mesh.faces)),
+            'watertight': bool(mesh.is_watertight),
+            'area_mm2': float(mesh.area) * 100.0,
+            'volume_mm3': float(mesh.volume) * 1000.0}
 
 
 def build(job, log):
@@ -2078,7 +2126,7 @@ def main():
         print(msg, flush=True)
 
     try:
-        res = build(job, log)
+        res = probe_cages(job, log) if job.get('probe') else build(job, log)
         res['log'] = lines
         res['ok'] = True
     except Exception:

@@ -1352,6 +1352,8 @@ def build_inputs(inputs, s):
 
     info = inputs.addTextBoxCommandInput('info', 'Mesh', '', 7, True)
     info.isFullWidth = True
+    inputs.addBoolValueInput('btnAuto', 'Auto: choose settings for this mesh',
+                             False, '', False)
     inputs.addBoolValueInput('btnAnalyze', 'Analyse gaps', False, '', False)
 
     g = inputs.addGroupCommandInput('grpAcc', 'Accuracy').children
@@ -1727,6 +1729,294 @@ def deep_info(sel_input):
     return _rows(pairs)
 
 
+
+# --------------------------------------------------------------------------- #
+# Auto: choose the settings by measuring, not by guessing
+# --------------------------------------------------------------------------- #
+
+def mesh_area_mm2(coords, idx):
+    """Surface area in mm2 from flat coordinate and index lists (coords in cm)."""
+    total = 0.0
+    for t in range(0, len(idx), 3):
+        a, b, c = idx[t], idx[t + 1], idx[t + 2]
+        ux = coords[3 * b] - coords[3 * a]
+        uy = coords[3 * b + 1] - coords[3 * a + 1]
+        uz = coords[3 * b + 2] - coords[3 * a + 2]
+        vx = coords[3 * c] - coords[3 * a]
+        vy = coords[3 * c + 1] - coords[3 * a + 1]
+        vz = coords[3 * c + 2] - coords[3 * a + 2]
+        px, py, pz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        total += 0.5 * math.sqrt(px * px + py * py + pz * pz)
+    return total * CM * CM
+
+
+def dihedral_character(coords, idx):
+    """How much of this mesh is flat. Stdlib, one pass over the edges.
+
+    A CAD export is mostly coplanar triangle pairs with a few sharp creases; a
+    scan is a continuum of small angles and almost nothing exactly flat. That is
+    the difference between a mesh Prismatic can handle and one where it refuses
+    or returns a one-face patch, so it is worth a tenth of a second to know which
+    one is on the table before choosing a method.
+    """
+    n_tri = len(idx) // 3
+    if n_tri < 4:
+        return {'coplanar': 0.0, 'sharp': 0.0, 'pairs': 0}
+
+    nx = [0.0] * n_tri
+    ny = [0.0] * n_tri
+    nz = [0.0] * n_tri
+    for t in range(n_tri):
+        a, b, c = idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]
+        ax, ay, az = coords[3 * a], coords[3 * a + 1], coords[3 * a + 2]
+        bx, by, bz = coords[3 * b], coords[3 * b + 1], coords[3 * b + 2]
+        cx, cy, cz = coords[3 * c], coords[3 * c + 1], coords[3 * c + 2]
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        vx, vy, vz = cx - ax, cy - ay, cz - az
+        px, py, pz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        ln = math.sqrt(px * px + py * py + pz * pz)
+        if ln > 1e-30:
+            nx[t], ny[t], nz[t] = px / ln, py / ln, pz / ln
+
+    owner = {}
+    flat = 0
+    sharp = 0
+    pairs = 0
+    for t in range(n_tri):
+        a, b, c = idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            o = owner.get(key)
+            if o is None:
+                owner[key] = t
+                continue
+            d = nx[o] * nx[t] + ny[o] * ny[t] + nz[o] * nz[t]
+            pairs += 1
+            if d > 0.99985:            # under 1 degree
+                flat += 1
+            elif d < 0.5:              # over 60 degrees
+                sharp += 1
+    if not pairs:
+        return {'coplanar': 0.0, 'sharp': 0.0, 'pairs': 0}
+    return {'coplanar': float(flat) / pairs, 'sharp': float(sharp) / pairs,
+            'pairs': pairs}
+
+
+def probe_ladder(diag_mm, area_mm2, quad_cap):
+    """Element sizes worth probing for this mesh, coarse to fine.
+
+    Spread over the range that is useful at all - a cage coarser than a
+    twentieth of the part carries no anatomy, and one finer than the cap costs
+    more than the result is worth - and stop where the cage would exceed the
+    quad cap, because that is the cost, not the accuracy, running out.
+    """
+    lo = math.sqrt(3.0 * area_mm2 / (math.sqrt(3.0) * max(quad_cap, 300)))
+    hi = max(diag_mm / 20.0, lo * 2.0)
+    out = []
+    h = hi
+    while h > lo * 0.999 and len(out) < 8:
+        out.append(round(h, 3))
+        h *= 0.68
+    if not out:
+        out = [round(max(lo, 0.2), 3)]
+    return out
+
+
+def auto_parameters(body, budget_mm, avail, quad_cap=16000, log=None):
+    """Measure this mesh, then choose. Returns (settings, notes).
+
+    Nothing here is a rule of thumb applied blind: the element size comes from
+    building the candidate cages and measuring them against the scan, which
+    costs about three seconds for the whole ladder because the cage is the cheap
+    half of the pipeline. Only the settings are returned - the caller writes them
+    into the dialog and the user presses OK, so the choice is always reviewable.
+    """
+    notes = []
+    coords, idx = read_triangles(body)
+    wc, wi = weld(coords, idx)
+    bb = body.boundingBox
+    diag = math.sqrt(sum((getattr(bb.maxPoint, a) - getattr(bb.minPoint, a)) ** 2
+                         for a in 'xyz')) * CM
+    gaps = sorted((loop_span_mm(wc, lp) for lp in boundary_loops(wi)), reverse=True)
+    char = dihedral_character(wc, wi)
+    closed = bool(body.isClosed)
+
+    o = {'max_error_mm': budget_mm, 'verify': True,
+         'escalate': True, 'max_attempts': 3}
+
+    # ---- preparation ----------------------------------------------------- #
+    if gaps:
+        o['fill_gaps'] = True
+        o['fill_all'] = False
+        o['max_gap_mm'] = gaps[0] * 1.05
+        notes.append('%d open boundary(ies), widest %.3f mm: gap filling on, '
+                     'limit set just above it' % (len(gaps), gaps[0]))
+    else:
+        o['fill_gaps'] = False
+        notes.append('no open boundaries, so nothing to fill')
+
+    if not body.isOriented:
+        o['repair_label'] = 'Stitch and remove artifacts'
+        notes.append('normals are inconsistent: stitch-and-remove-artifacts on')
+    else:
+        o['repair_label'] = 'None'
+
+    # ---- method ----------------------------------------------------------- #
+    # What separates machined geometry from a scan is not flatness alone - a
+    # cube is only a third coplanar, because its other edges are 90 degree
+    # creases - it is that EVERY edge is one or the other. A scan is a continuum
+    # of small angles and lands in neither bucket: the distal radius scores 19 %
+    # against the cube's 100 %.
+    decided = char['coplanar'] + char['sharp']
+    mechanical = decided > 0.60 and char['coplanar'] > 0.15
+    notes.append('%.0f %% of adjacent triangle pairs are flat and %.0f %% are '
+                 'crisp creases - %.0f %% decided either way, so this reads as %s'
+                 % (100.0 * char['coplanar'], 100.0 * char['sharp'],
+                    100.0 * decided,
+                    'machined geometry' if mechanical else 'organic geometry'))
+
+    def ok(k):
+        return avail.get(k, (False, ''))[0]
+
+    if mechanical and ok('prismatic'):
+        o['method_key'] = 'prismatic'
+        o['face_groups'] = True
+        o['resolution'] = 'Auto from max error'
+        notes.append('Prismatic: it rebuilds planes and cylinders as real '
+                     'analytic faces, which is what this mesh is made of')
+        return o, notes, None
+    if not closed and not gaps:
+        notes.append('the mesh is neither closed nor bounded by loops the tool '
+                     'can close, and the organic methods need a closed surface')
+        o['method_key'] = 'faceted' if ok('faceted') else 'prismatic'
+        return o, notes, None
+    if not ok('quad_cage'):
+        o['method_key'] = ('form' if ok('form')
+                           else 'faceted' if ok('faceted') else 'prismatic')
+        notes.append('the quad cage is unavailable (%s), falling back'
+                     % avail.get('quad_cage', (False, 'no engine'))[1])
+        return o, notes, None
+
+    # ---- element size, by measuring the candidate cages ------------------- #
+    o['method_key'] = 'quad_cage'
+    o['cage_source'] = 'scan'
+    ladder = probe_ladder(diag, mesh_area_mm2(wc, wi), quad_cap)
+    res = run_engine(wc, wi, {'probe': ladder, 'probe_samples': 20000},
+                     timeout=600)
+    rows = [r for r in res['probe'] if 'max_mm' in r]
+    if not rows:
+        notes.append('the cage probe returned nothing usable; leaving the '
+                     'element size alone')
+        return o, notes, None
+
+    # The budget is checked against the WORST single point in either direction.
+    # Across 8.0 to 1.2 mm on a distal radius that came out at 0.44 to 0.53 of
+    # the cage's own max, so the cage max is used directly as the predictor -
+    # that is roughly a factor of two in hand, which the noise deserves: the
+    # worst-point statistic is not monotone in element size even though the rms
+    # is, because it is set by isolated spots on the scan rather than by the
+    # cage.
+    safe = [r for r in rows if r['pessimistic_mm'] <= budget_mm]
+    likely = [r for r in rows if r['predicted_mm'] <= budget_mm]
+    if safe:
+        pick = max(safe, key=lambda r: r['element_mm'])    # coarsest that fits
+        notes.append('element %.2f mm: the coarsest probed cage whose own worst '
+                     'deviation (%.3f mm) is already inside the budget, so the '
+                     'fit has the whole of it in hand'
+                     % (pick['element_mm'], pick['max_mm']))
+    elif likely:
+        pick = max(likely, key=lambda r: r['element_mm'])
+        notes.append('element %.2f mm: no cage is inside the budget on its own '
+                     '(this one is %.3f mm out), but the fit has landed at about '
+                     'half the cage figure on every size measured, so this should '
+                     'come in near %.3f mm'
+                     % (pick['element_mm'], pick['max_mm'], pick['predicted_mm']))
+    else:
+        pick = min(rows, key=lambda r: r['element_mm'])
+        notes.append('nothing probed reaches the %.3f mm budget: the finest cage '
+                     'the cost cap allows is %.2f mm, worst %.3f mm, expected '
+                     'about %.3f mm fitted. Raise the budget, or accept that the '
+                     'ladder will report OVER.'
+                     % (budget_mm, pick['element_mm'], pick['max_mm'],
+                        pick['predicted_mm']))
+    o['quad_size_mm'] = pick['element_mm']
+    secs = 7.0 + 0.0022 * pick['quads']
+    notes.append('that cage is %d quads; expect about %.0f s for the fit, and '
+                 'roughly %.3f mm on the measurement if the scan behaves'
+                 % (pick['quads'], secs, pick['predicted_mm']))
+    notes.append('escalation is on with 3 attempts, so if the measurement comes '
+                 'out over budget the ladder refines and reports what it used')
+    return o, notes, rows
+
+
+def auto_apply(inputs, budget_mm=None):
+    """Run the chooser for the selected body and write it into the dialog."""
+    bodies = selected_bodies(inputs.itemById('selMesh'))
+    if not bodies:
+        return _rows([('', 'Select a mesh body first, then press Auto.')])
+    body = bodies[0]
+    if budget_mm is None:
+        budget_mm = inputs.itemById('maxError').value * CM
+    avail = probe_methods(body.parentComponent, body)
+    t0 = time.time()
+    o, notes, rows = auto_parameters(body, budget_mm, avail)
+
+    inputs.itemById('escalate').value = bool(o.get('escalate', True))
+    inputs.itemById('maxAttempts').value = int(o.get('max_attempts', 3))
+    inputs.itemById('verify').value = True
+    if 'fill_gaps' in o:
+        inputs.itemById('fillGaps').value = bool(o['fill_gaps'])
+        inputs.itemById('fillAll').value = bool(o.get('fill_all', False))
+        if o.get('max_gap_mm'):
+            inputs.itemById('maxGap').value = o['max_gap_mm'] * MM
+    if o.get('repair_label'):
+        rep = inputs.itemById('repair')
+        for i, (lab, _en) in enumerate(REPAIR_MODES):
+            if lab == o['repair_label']:
+                rep.listItems.item(i).isSelected = True
+    if o.get('quad_size_mm'):
+        inputs.itemById('quadSize').value = o['quad_size_mm'] * MM
+    if o.get('cage_source'):
+        cs = inputs.itemById('cageSource')
+        for i, (key, _lab) in enumerate(CAGE_SOURCES):
+            if key == o['cage_source']:
+                cs.listItems.item(i).isSelected = True
+    if o.get('face_groups') is not None:
+        inputs.itemById('faceGroups').value = bool(o['face_groups'])
+    # the method last: changing it re-runs the visibility rules
+    md = inputs.itemById('method')
+    label = METHOD_BY_KEY[o['method_key']][0]
+    for i in range(md.listItems.count):
+        if md.listItems.item(i).name == label:      # exact, never a prefix
+            md.listItems.item(i).isSelected = True
+            break
+    refresh_visibility(inputs)
+
+    pairs = [('chose', METHOD_BY_KEY[o['method_key']][0]),
+             ('budget', '%.3f mm' % budget_mm)]
+    if o.get('quad_size_mm'):
+        pairs.append(('element size', '%.2f mm' % o['quad_size_mm']))
+    for n in notes:
+        pairs.append(('', n))
+    if rows:
+        pairs.append(('', '&nbsp;'))
+        pairs.append(('cage probe', 'element &rarr; the cage\'s own worst '
+                                    'distance from the scan'))
+        for r in rows:
+            pairs.append(('', '%.2f mm &rarr; %.3f mm worst, %.3f p99, '
+                              '%d quads%s'
+                          % (r['element_mm'], r['max_mm'], r['p99_mm'],
+                             r['quads'],
+                             '  &larr; chosen'
+                             if abs(r['element_mm']
+                                    - o.get('quad_size_mm', -1)) < 1e-9 else '')))
+    pairs.append(('', '&nbsp;'))
+    pairs.append(('', 'Settings written into this dialog in %.1f s. Nothing is '
+                      'converted until you press OK, so change anything you '
+                      'disagree with.' % (time.time() - t0)))
+    return _rows(pairs)
+
+
 def collect_mesh_bodies(comp, out):
     """Every mesh body in the assembly, at ANY depth.
 
@@ -1826,6 +2116,14 @@ def populate_methods_placeholder(inputs, preferred):
 
 
 def on_input_changed(app, inputs, changed_id):
+    if changed_id == 'btnAuto':
+        try:
+            inputs.itemById('info').formattedText = auto_apply(inputs)
+        except Exception:
+            log(traceback.format_exc())
+            inputs.itemById('info').formattedText = _rows(
+                [('Auto failed', short_error(traceback.format_exc()))])
+        return
     if changed_id == 'btnAnalyze':
         inputs.itemById('info').formattedText = deep_info(inputs.itemById('selMesh'))
         return
@@ -1970,6 +2268,21 @@ def dev_probe(app, job):
     avail = probe_methods(b.parentComponent, b)
     return {'body': b.name,
             'methods': {k: {'ok': v[0], 'why': v[1]} for k, v in avail.items()}}
+
+
+def dev_auto(app, job):
+    """What Auto would choose for a body, without opening the dialog."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    found = []
+    collect_mesh_bodies(des.rootComponent, found)
+    if not found:
+        return {'error': 'no mesh body in the active document'}
+    b = _pick_body(found, job)
+    avail = probe_methods(b.parentComponent, b)
+    t0 = time.time()
+    o, notes, rows = auto_parameters(b, float(job.get('max_error_mm', 1.0)), avail)
+    return {'body': b.name, 'options': o, 'notes': notes, 'probe': rows,
+            'secs': round(time.time() - t0, 2)}
 
 
 def dev_analyse(app, job):
@@ -3353,6 +3666,7 @@ DEV_COMMANDS = {
     'probe': dev_probe,
     'panels': dev_panels,
     'analyse': dev_analyse,
+    'auto': dev_auto,
     'make_test_doc': dev_make_test_doc,
     'clone_to_new_doc': dev_clone_to_new_doc,
     'convert': dev_convert,
