@@ -10,3 +10,6 @@ last_settings.json
 # local machine configuration
 python_path.txt
 devbridge.on
+
+# icon tuning artefacts
+tools/_preview/
