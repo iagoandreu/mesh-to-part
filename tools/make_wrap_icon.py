@@ -47,13 +47,15 @@ GREEN = os.path.join(ART, 'Icono_Wrap_Verde.png')
 THEMES = {
     'light': {'grey': ((0x91, 0x91, 0x91), (0xF3, 0xF3, 0xF3)),
               'blue': ((0x3F, 0x85, 0xB7), (0x89, 0xCB, 0xFA)),
-              'ink': (0x66, 0x66, 0x66),
-              'outline_px_at_64': 2.0},
+              'ink': (0x66, 0x66, 0x66)},
     'dark': {'grey': ((0xBB, 0xBB, 0xBB), (0xF3, 0xF3, 0xF3)),
              'blue': ((0x67, 0xB1, 0xE6), (0xB2, 0xDF, 0xFF)),
-             'ink': None,
-             'outline_px_at_64': 0.0},
+             'ink': None},
 }
+
+# How thick the ink border must come out, in FINAL pixels. Measured on
+# solid/shell and Modeling/OffsetFaces: 1 px at 16 and at 32, 2 px at 64.
+TARGET_BORDER = {16: 1, 32: 1, 64: 2}
 
 SUPERSAMPLE = 8
 SPECK = 40                 # px at source scale: antialiasing crumbs, not shape
@@ -116,12 +118,10 @@ def recolour(rgba, theme):
     return out
 
 
-def build(size, theme, scale=1):
-    """One png. `scale` 2 makes the @2x twin, at double resolution."""
-    px = size * scale
+def _compose(px, theme, pen):
+    """Artwork on its canvas, dilated by `pen` working pixels of ink."""
     S = px * SUPERSAMPLE
     pal = THEMES[theme]
-
     art = recolour(artwork(), theme)
     inner = int(round(S * (1.0 - 2.0 * MARGIN)))
     small = Image.fromarray(art).resize((inner, inner), Image.LANCZOS)
@@ -129,20 +129,85 @@ def build(size, theme, scale=1):
     off = (S - inner) // 2
     canvas.paste(small, (off, off), small)
     rgba = np.array(canvas)
-    mask = rgba[:, :, 3] > 128
 
     # the outline is a DILATION, not a stroke: a stroke is centred on the edge,
     # so half of it lands inside the artwork and gets covered
-    pen = pal['outline_px_at_64'] * px / 64.0 * SUPERSAMPLE
-    if pal['ink'] is not None and pen >= 1.0:
-        grown = ndimage.distance_transform_edt(~mask) <= pen
-        out = np.zeros_like(rgba)
-        out[grown] = tuple(pal['ink']) + (255,)
-        out[mask] = rgba[mask]
-    else:
-        out = rgba
-
+    if pal['ink'] is None or pen < 1:
+        return Image.fromarray(rgba).resize((px, px), Image.LANCZOS)
+    mask = rgba[:, :, 3] > 128
+    grown = ndimage.distance_transform_edt(~mask) <= pen
+    out = np.zeros_like(rgba)
+    out[grown] = tuple(pal['ink']) + (255,)
+    out[mask] = rgba[mask]
     return Image.fromarray(out).resize((px, px), Image.LANCZOS)
+
+
+_PEN_CACHE = {}
+
+
+def calibrated_pen(px, theme):
+    """The pen that MEASURES the native weight, rather than the one that should.
+
+    Computing it as target * supersample came out a pixel fat at every size, and
+    stayed fat through two rounds of "still too thick". The reason is the
+    threshold: the dilation grows from alpha > 128, so the artwork's own
+    antialiased fringe - everything between 10 and 128 - is swallowed by the ink
+    and lands outside the shape as extra border. The bias depends on the artwork,
+    so it is measured rather than assumed: widen the pen until the border comes
+    out at the target and stop.
+    """
+    key = (px, theme)
+    if key in _PEN_CACHE:
+        return _PEN_CACHE[key]
+    pal = THEMES[theme]
+    if pal['ink'] is None:
+        _PEN_CACHE[key] = 0
+        return 0
+    target = TARGET_BORDER.get(px, max(1, round(2.0 * px / 64.0)))
+    best = 1
+    for pen in range(1, 4 * SUPERSAMPLE + 1):
+        got = measure_outline(_compose(px, theme, pen), pal['ink'])
+        if got >= target:
+            best = pen
+            break
+        best = pen
+    _PEN_CACHE[key] = best
+    return best
+
+
+def build(size, theme, scale=1):
+    """One png. `scale` 2 makes the @2x twin, at double resolution."""
+    px = size * scale
+    pen = calibrated_pen(px, theme)
+    img = _compose(px, theme, pen)
+    return img, measure_outline(img, THEMES[theme]['ink'])
+
+
+def measure_outline(img, ink):
+    """Median thickness of the ink border, counting ONLY ink-coloured pixels.
+
+    Measuring "any dark pixel" instead counts the render's own shadows - its
+    darkest blue is #2B3540 - and reports an outline three pixels thick when the
+    pen drew one. The number to compare against is 2 px at 64 and 1 px at 32,
+    which is what solid/shell and solid/thicken carry.
+    """
+    if ink is None:
+        return 0.0
+    a = np.array(img).astype(int)
+    op = a[:, :, 3] > 10
+    near = (op & (abs(a[:, :, 0] - ink[0]) < 26) & (abs(a[:, :, 1] - ink[1]) < 26)
+            & (abs(a[:, :, 2] - ink[2]) < 26))
+    runs = []
+    for y in range(a.shape[0]):
+        r = np.nonzero(op[y])[0]
+        if not len(r):
+            continue
+        x0, n = r.min(), 0
+        while x0 + n < a.shape[1] and near[y, x0 + n]:
+            n += 1
+        if n:
+            runs.append(n)
+    return float(np.median(runs)) if runs else 0.0
 
 
 def main():
@@ -156,17 +221,21 @@ def main():
                     continue           # Fusion ships no 64x64@2x either
                 at = '@2x' if scale == 2 else ''
                 name = '%dx%d%s%s.png' % (size, size, suffix, at)
-                build(size, theme, scale).save(os.path.join(OUT, name))
-                written.append(name)
+                img, edge = build(size, theme, scale)
+                img.save(os.path.join(OUT, name))
+                written.append((name, edge))
     print('wrote %d files to %s' % (len(written), OUT))
-    for n in sorted(written):
-        print('   %s' % n)
+    print('   %-24s %-16s %s' % ('file', 'ink border, px', 'target'))
+    for n, edge in sorted(written):
+        px = int(n.split('x')[0]) * (2 if '@2x' in n else 1)
+        t = 0 if '-dark' in n else TARGET_BORDER.get(px, '?')
+        print('   %-24s %-16.1f %s' % (n, edge, t))
 
     prev = os.path.join(HERE, '_preview')
     os.makedirs(prev, exist_ok=True)
     for theme in ('light', 'dark'):
         for size in (16, 32, 64):
-            build(size, theme).resize((256, 256), Image.NEAREST).save(
+            build(size, theme)[0].resize((256, 256), Image.NEAREST).save(
                 os.path.join(prev, 'wrap_%s_%d.png' % (theme, size)))
 
 
