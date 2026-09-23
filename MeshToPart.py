@@ -47,6 +47,9 @@ CMD_TOOLTIP = (
 
 ADDIN_DIR = os.path.dirname(os.path.realpath(__file__))
 RES_DIR = os.path.join(ADDIN_DIR, 'resources', 'MeshToPart')
+# the Wrap button has its own icon: sharing one made the only way to tell the
+# two buttons apart reading the label
+WRAP_RES_DIR = os.path.join(ADDIN_DIR, 'resources', 'Wrap')
 LOG_PATH = os.path.join(ADDIN_DIR, 'MeshToPart.log')
 
 DEV_FLAG = os.path.join(ADDIN_DIR, 'devbridge.on')
@@ -326,7 +329,7 @@ def run(context):
         if old_wrap:
             old_wrap.deleteMe()
         wrap_def = _ui.commandDefinitions.addButtonDefinition(
-            WRAP_CMD_ID, WRAP_CMD_NAME, WRAP_TOOLTIP, RES_DIR)
+            WRAP_CMD_ID, WRAP_CMD_NAME, WRAP_TOOLTIP, WRAP_RES_DIR)
         wh = _WrapCreated()
         wrap_def.commandCreated.add(wh)
         _handlers.append(wh)
