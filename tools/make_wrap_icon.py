@@ -59,7 +59,7 @@ TARGET_BORDER = {16: 1, 32: 1, 64: 2}
 
 SUPERSAMPLE = 8
 SPECK = 40                 # px at source scale: antialiasing crumbs, not shape
-MARGIN = 0.02              # of the canvas, per side
+AIR = 1.0                  # final pixels of clearance BEYOND the outline
 
 
 def artwork():
@@ -119,15 +119,28 @@ def recolour(rgba, theme):
 
 
 def _compose(px, theme, pen):
-    """Artwork on its canvas, dilated by `pen` working pixels of ink."""
+    """Artwork on its canvas, dilated by `pen` working pixels of ink.
+
+    The canvas reserves room for the outline BEFORE the artwork is scaled into
+    it. Growing a shape that already fills 96 % of the frame pushes the outline
+    off the edge, and the icon comes back with its left and right sides sliced
+    flat - 30 and 34 opaque pixels hard against the border at 64 px.
+
+    Aspect is preserved. The drawing is 712 x 813, and resizing that crop to a
+    square canvas stretched it 14 % wider than it should be.
+    """
     S = px * SUPERSAMPLE
     pal = THEMES[theme]
     art = recolour(artwork(), theme)
-    inner = int(round(S * (1.0 - 2.0 * MARGIN)))
-    small = Image.fromarray(art).resize((inner, inner), Image.LANCZOS)
+    h, w = art.shape[:2]
+
+    pad = pen + AIR * SUPERSAMPLE
+    box = S - 2.0 * pad
+    k = min(box / w, box / h)
+    tw, th = max(1, int(round(w * k))), max(1, int(round(h * k)))
+    small = Image.fromarray(art).resize((tw, th), Image.LANCZOS)
     canvas = Image.new('RGBA', (S, S), (0, 0, 0, 0))
-    off = (S - inner) // 2
-    canvas.paste(small, (off, off), small)
+    canvas.paste(small, ((S - tw) // 2, (S - th) // 2), small)
     rgba = np.array(canvas)
 
     # the outline is a DILATION, not a stroke: a stroke is centred on the edge,
