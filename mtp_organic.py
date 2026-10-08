@@ -1581,6 +1581,128 @@ def cage_coverage(points, faces, mesh, samples=40000, seed=20260922):
             'volume_pct': float(100.0 * (cage.volume - mesh.volume) / mesh.volume)}
 
 
+def dissolve_doublets(faces):
+    """Remove valence-2 vertices: two quads (v,a,x,b) and (v,b,y,a) sharing the
+    consecutive edges v-a and v-b become the one quad (a,x,b,y).
+
+    Instant Meshes leaves a few. A doublet is a degenerate T-spline vertex, and
+    its two quads share both a and b, so their fan triangulations put the same
+    diagonal in four triangles."""
+    faces = [list(q) for q in faces]
+    removed = 0
+    changed = True
+    while changed:
+        changed = False
+        inc = {}
+        for fi, q in enumerate(faces):
+            if q is None:
+                continue
+            for v in q:
+                inc.setdefault(v, []).append(fi)
+        for v, fs in inc.items():
+            if len(fs) != 2:
+                continue
+            f1, f2 = faces[fs[0]], faces[fs[1]]
+            if f1 is None or f2 is None or len(f1) != 4 or len(f2) != 4:
+                continue
+            k = f1.index(v)
+            a, x, b = f1[(k + 1) % 4], f1[(k + 2) % 4], f1[(k + 3) % 4]
+            j = f2.index(v)
+            nb = f2[(j + 1) % 4], f2[(j + 3) % 4]
+            if set(nb) != {a, b}:
+                continue
+            y = f2[(j + 2) % 4]
+            if y in (a, b, x):
+                continue
+            faces[fs[0]] = [a, x, b, y]
+            faces[fs[1]] = None
+            removed += 1
+            changed = True
+            break
+    return [tuple(q) for q in faces if q is not None], removed
+
+
+def instant_quad_cage(mesh, job, log):
+    """A field-aligned all-quad cage from Instant Meshes (Jakob et al. 2015).
+    Points in CENTIMETRES.
+
+    The scan cage quadrangulates triangles, which leaves a valence-3 star at
+    every centroid - half the vertices extraordinary. Instant Meshes solves an
+    orientation field and a position field on the scan and extracts quads that
+    follow them, so the cage is rows of quads with about 2 % extraordinary
+    vertices: a clean Form that is easy to edit, and it fits 3x faster. It is
+    NOT the more accurate cage. Measured on a 499 mm artificial femur at about
+    6000 quads each: scan cage p99 0.12 / max 1.2 mm, this one p99 0.19 / max
+    1.8 mm, both with no folds - the scan cage's vertices are scan vertices,
+    these are not. Needs `pip install PyNanoInstantMeshes`.
+
+    Its extraction ends in one regular subdivision into pure quads, so the face
+    count is about four times the vertex count asked for; the request is sized
+    for the final quads to land near hmax_mm.
+    """
+    import pynanoinstantmeshes as pim
+
+    h = float(job.get('hmax_mm', 8.0))
+    cap = int(job.get('cage_quad_cap', 24000))
+    area_mm2 = float(mesh.area) * 100.0
+    quads = max(200, min(int(area_mm2 / (h * h)), cap))
+    v = (np.asarray(mesh.vertices, float) * 10.0).astype(np.float32)
+    f = np.asarray(mesh.faces).astype(np.uint32)
+    V, F = pim.remesh(v, f, max(50, quads // 4), rosy=4, posy=4,
+                      smooth_iter=int(job.get('instant_smooth', 2)),
+                      deterministic=True)
+    V = np.asarray(V, float)
+    faces = []
+    for q in np.asarray(F):
+        u = []
+        for i in (int(x) for x in q):
+            if not u or u[-1] != i:          # a triangle comes back with a repeated corner
+                u.append(i)
+        if len(u) > 1 and u[0] == u[-1]:
+            u.pop()
+        if len(u) >= 3:
+            faces.append(tuple(u))
+    faces, n_doublets = dissolve_doublets(faces)
+    used = np.unique(np.concatenate([np.array(q) for q in faces]))
+    remap = -np.ones(len(V), np.int64)
+    remap[used] = np.arange(len(used))
+    V = V[used]
+    faces = [tuple(int(remap[i]) for i in q) for q in faces]
+
+    # closed means every POLYGON edge is used twice; a fan triangulation is no
+    # test, because its diagonals are not cage edges
+    uses = {}
+    for q in faces:
+        for k in range(len(q)):
+            e = (min(q[k], q[k - 1]), max(q[k], q[k - 1]))
+            uses[e] = uses.get(e, 0) + 1
+    if any(c != 2 for c in uses.values()):
+        raise RuntimeError('Instant Meshes returned an open cage')
+    faces = orient_faces(faces)
+    tri = [(q[0], q[k - 1], q[k]) for q in faces for k in range(2, len(q))]
+    if trimesh.Trimesh(vertices=V, faces=np.array(tri), process=False).volume < 0:
+        faces = [tuple(reversed(q)) for q in faces]
+    if n_doublets:
+        log('  instant cage: %d doublet vertices dissolved' % n_doublets)
+    val = np.bincount(np.concatenate([np.array(q) for q in faces]), minlength=len(V))
+    nq = sum(1 for q in faces if len(q) == 4)
+    log('  instant cage: %d quads + %d other faces, %d vertices, %.1f %% '
+        'extraordinary (element %.2f mm asked)'
+        % (nq, len(faces) - nq, len(V), 100.0 * float((val != 4).mean()), h))
+    return V * 0.1, faces
+
+
+def make_cage(mesh, job, log):
+    """The cage for job['cage_source']; Instant Meshes falls back to the scan cage."""
+    if job.get('cage_source') == 'instant':
+        try:
+            return instant_quad_cage(mesh, job, log), 'instant'
+        except Exception as exc:
+            log('  instant cage unavailable (%s: %s), using the scan cage'
+                % (type(exc).__name__, exc))
+    return scan_quad_cage(mesh, job, log), 'scan'
+
+
 def scan_quad_cage(mesh, job, log):
     """An all-quad cage taken straight off the scan. Points in CENTIMETRES.
 
@@ -1784,15 +1906,19 @@ def probe_cages(job, log):
     for h in job['probe']:
         row = {'element_mm': float(h)}
         try:
-            pts, cf = scan_quad_cage(mesh, dict(job, hmax_mm=float(h)),
-                                     lambda m: None)
+            (pts, cf), used = make_cage(mesh, dict(job, hmax_mm=float(h)),
+                                        lambda m: None)
             cov = cage_coverage(pts, cf, mesh,
                                 samples=int(job.get('probe_samples', 20000)))
             row.update(cov)
             row['quads'] = int(sum(1 for f in cf if len(f) == 4))
             row['vertices'] = int(len(pts))
             # what the fit is expected to land on, and the pessimistic reading
-            row['predicted_mm'] = 0.5 * cov['max_mm']
+            # the fit lands at 0.44-0.53 of a scan cage's max (distal radius) but
+            # only 0.76-0.86 of an instant cage's (proxy femur): the instant
+            # cage is not a subset of the scan's vertices, so it starts further off
+            row['cage_source'] = used
+            row['predicted_mm'] = (0.9 if used == 'instant' else 0.5) * cov['max_mm']
             row['pessimistic_mm'] = cov['max_mm']
         except Exception as exc:
             row['error'] = '%s: %s' % (type(exc).__name__, exc)
@@ -1822,7 +1948,7 @@ def build(job, log):
     cage_source_used = None
     cage_cover = None
 
-    if job.get('cage_source') in ('gmsh', 'scan'):
+    if job.get('cage_source') in ('gmsh', 'scan', 'instant'):
         if job.get('output') != 'tsm':
             raise RuntimeError('the quad cage is a Form (T-Spline) cage; '
                                'the NURBS path needs the cube-sphere')
@@ -1843,8 +1969,8 @@ def build(job, log):
                     'reparametrisation has lost part of the scan, '
                     'falling back to the scan-derived cage')
                 source = 'scan'
-        if source == 'scan':
-            points, cage_faces = scan_quad_cage(mesh, job, log)
+        if source in ('scan', 'instant'):
+            (points, cage_faces), source = make_cage(mesh, dict(job, cage_source=source), log)
             cover = cage_coverage(points, cage_faces, mesh)
             log('  cage covers the scan to max %.3f p99 %.3f mm, volume %+.2f %%'
                 % (cover['max_mm'], cover['p99_mm'], cover['volume_pct']))

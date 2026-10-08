@@ -85,18 +85,46 @@ METHOD_BY_KEY = {k: (lab, en) for k, lab, en in METHODS}
 
 RESOLUTIONS = ['Auto from max error', 'Low', 'Medium', 'High', 'Precise', 'By face count']
 
-# key, label. The scan cage is first because it is the default: it is taken off
-# the scan itself, so it cannot wander off the surface, and a smaller element
-# always gives a better body. gmsh's is prettier - cleaner rows of quads - but
+# key, label; the first is the dialog's default. Instant Meshes gives the
+# cleanest Form. The scan cage is taken off the scan itself, so it cannot wander
+# off the surface, a smaller element always gives a better body, and per quad it
+# is the most accurate - Auto uses it. gmsh's is prettier - cleaner rows of quads - but
 # it comes from a global reparametrisation that on a bone loses whole features,
 # and asking it for finer elements only resolves the distortion better.
 CAGE_SOURCES = [
+    # field-aligned rows of quads, ~2 % extraordinary vertices against ~50 % for
+    # the scan cage: the cleanest Form to edit, fitted 3x faster, but LESS
+    # accurate at the same quad count (femur, 6k quads: p99 0.19 vs 0.12 mm), so
+    # Auto, which chases an error budget, keeps the scan cage. Falls back to the
+    # scan cage by itself when the module is missing or the cage comes back open
+    ('instant', 'Instant Meshes (cleanest quads, pip install PyNanoInstantMeshes)'),
     ('scan', 'From the scan (robust, any element size)'),
     ('gmsh', 'gmsh remesh (tidier quads, needs pip install gmsh)'),
 ]
 
 
 _GMSH_OK = None
+_INSTANT_OK = None
+
+
+def has_instant():
+    """Is Instant Meshes importable in the engine's interpreter? Cached."""
+    global _INSTANT_OK
+    if _INSTANT_OK is None:
+        import subprocess
+        exe = python_cmd()
+        try:
+            r = subprocess.run(exe + ['-c', 'import pynanoinstantmeshes'],
+                               capture_output=True, timeout=90,
+                               creationflags=NO_WINDOW) if exe else None
+            _INSTANT_OK = bool(r is not None and r.returncode == 0)
+        except Exception:
+            _INSTANT_OK = False
+    return _INSTANT_OK
+
+
+def default_cage_source():
+    return 'instant' if has_instant() else 'scan'
 
 
 def has_gmsh():
@@ -860,7 +888,7 @@ def run_pipeline(app, src_body, o, progress=None):
         try:
             if o['method_key'] in ('quad_cage', 'custom_organic', 'form'):
                 if o['method_key'] == 'quad_cage':
-                    params = {'cage_source': o.get('cage_source', 'scan'),
+                    params = {'cage_source': o.get('cage_source') or default_cage_source(),
                               'hmax_mm': float(rung['hmax']),
                               # gmsh's own size floor scales with the rung, or
                               # the ladder refines nothing: the curvature field
@@ -1899,9 +1927,12 @@ def auto_parameters(body, budget_mm, avail, quad_cap=16000, log=None):
 
     # ---- element size, by measuring the candidate cages ------------------- #
     o['method_key'] = 'quad_cage'
+    # the scan cage: Auto chases an error budget, and per quad the scan cage is
+    # the more accurate of the two (see CAGE_SOURCES)
     o['cage_source'] = 'scan'
     ladder = probe_ladder(diag, mesh_area_mm2(wc, wi), quad_cap)
-    res = run_engine(wc, wi, {'probe': ladder, 'probe_samples': 20000},
+    res = run_engine(wc, wi, {'probe': ladder, 'probe_samples': 20000,
+                              'cage_source': o['cage_source']},
                      timeout=600)
     rows = [r for r in res['probe'] if 'max_mm' in r]
     if not rows:
@@ -2439,7 +2470,7 @@ def dev_options(over):
         'wrap_offset_mm': 0.0, 'wrap_close_mm': 0.0, 'wrap_smooth': 15,
         'aspect_limit': 1.2, 'aspect_iters': 80, 'aspect_gain': 2.0,
         'quad_size_mm': 8.0, 'curvature': 16.0, 'cage_input_tris': 20000,
-        'cage_source': 'scan', 'cage_square_iters': 0,
+        'cage_source': None, 'cage_square_iters': 0,
         'square_iters': 120, 'square_weight': 0.6, 'min_edge_mm': 0.0,
         'smooth_iters': 0, 'smooth_band': 0.1,
         'wrap_iters': 50, 'relax_iters': 70,

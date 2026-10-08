@@ -135,9 +135,10 @@ pip install numpy scipy trimesh pyvista
 ```
 
 `pyvista` is needed by the Wrap tool (VTK marching cubes and exact
-point-to-surface distance) and by the **quad cage** method's default cage. Only
-the quad cage's *gmsh* cage source needs `pip install gmsh`; without it the
-method still works, from the scan cage.
+point-to-surface distance) and by the **quad cage** method's scan cage. The quad
+cage's *Instant Meshes* source needs `pip install PyNanoInstantMeshes` and its
+*gmsh* source needs `pip install gmsh`; without them the method still works, from
+the scan cage.
 
 The add-in finds an interpreter automatically — the `MESHTOPART_PYTHON`
 environment variable, a `python_path.txt` beside the add-in, the usual install
@@ -162,9 +163,23 @@ lifted out of them. From there the two methods diverge:
 The **quad cage** method does not stretch a cube onto the scan at all. It builds a
 cage at a prescribed element size, so element size is the input and the count
 follows — which is what lets it hold an edge-length ratio on anatomy where a fixed
-grid cannot. There are two sources, chosen in the dialog:
+grid cannot. There are three sources, chosen in the dialog:
 
-**From the scan** (the default). Decimate the scan to the triangle count that lands
+**Instant Meshes** (the dialog's default). A field-aligned quad remesh (Jakob et al.
+2015, via `pip install PyNanoInstantMeshes`): it solves an orientation field and a
+position field on the scan and extracts quads that follow them, so the cage is rows
+of quads with about 2 % extraordinary vertices, against about 50 % for the scan cage.
+The result is the cleanest Form to edit, and it fits about 3x faster. It is *not* the
+more accurate cage: its vertices are not scan vertices. The few doublets (valence-2
+vertices) it leaves are dissolved, and if the module is missing or the cage comes
+back open the scan cage is used instead.
+
+| 499 mm artificial femur, ~6000 quads | max | p99 | rms | extraordinary | fit |
+|---|---|---|---|---|---|
+| Instant Meshes cage | 1.81 mm | 0.19 mm | 0.049 mm | 2.6 % | 11 s |
+| scan cage | 1.23 mm | 0.12 mm | 0.036 mm | ~50 % | 34 s |
+
+**From the scan** (what Auto uses, because Auto chases an error budget). Decimate the scan to the triangle count that lands
 the quad edge on the requested size, then quadrangulate: every triangle becomes
 three quads through its edge midpoints and its centroid. All three kinds of vertex
 lie on the decimated surface, so the cage cannot wander off the scan, and density is
