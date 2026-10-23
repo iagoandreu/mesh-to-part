@@ -154,6 +154,74 @@ check('a non-solid result from a closed mesh is called out',
       'dropped geometry' in txt)
 check('a refused rung shows its reason', 'refused: MESH_FAILED_BREP' in txt)
 
+
+# --------------------------------------------------------------------------- #
+# cylinder / cone fitting, on tessellated shapes built here (mm in, cm to the fitter)
+# --------------------------------------------------------------------------- #
+
+def prism_mesh(n, ra, rb, length, axis, origin, centre_fan=False, phase=0.0):
+    ln = math.sqrt(sum(a * a for a in axis))
+    ax = [a / ln for a in axis]
+    h = [1.0, 0.0, 0.0] if abs(ax[0]) < 0.9 else [0.0, 1.0, 0.0]
+    e1 = [ax[1] * h[2] - ax[2] * h[1], ax[2] * h[0] - ax[0] * h[2], ax[0] * h[1] - ax[1] * h[0]]
+    l1 = math.sqrt(sum(a * a for a in e1))
+    e1 = [a / l1 for a in e1]
+    e2 = [ax[1] * e1[2] - ax[2] * e1[1], ax[2] * e1[0] - ax[0] * e1[2], ax[0] * e1[1] - ax[1] * e1[0]]
+    V, T = [], []
+    for z, r in ((0.0, ra), (length, rb)):
+        for k in range(n):
+            a = 2 * math.pi * k / n + phase
+            V.append([origin[i] + z * ax[i] + r * (math.cos(a) * e1[i] + math.sin(a) * e2[i])
+                      for i in range(3)])
+    for k in range(n):
+        j = (k + 1) % n
+        T += [(k, j, n + j), (k, n + j, n + k)]
+    if centre_fan:
+        V.append(list(origin))
+        V.append([origin[i] + length * ax[i] for i in range(3)])
+        for k in range(n):
+            j = (k + 1) % n
+            T += [(2 * n, j, k), (2 * n + 1, n + k, n + j)]
+    else:
+        for k in range(1, n - 1):
+            T += [(0, k + 1, k), (n, n + k, n + k + 1)]
+    return [c * 0.1 for v in V for c in v], [i for t in T for i in t]
+
+
+print('cylinder / cone fit')
+c, i = prism_mesh(24, 2.5, 2.5, 30.0, (0.3, 0.5, 0.8), (10.0, -5.0, 3.0))
+f = M.fit_cylinder_cone(c, i)
+check('a 24-facet cylinder on a skew axis is a cylinder', f['kind'] == 'cylinder')
+check('its diameter is 5 mm', abs(2 * f['r_a'] * 10 - 5.0) < 1e-6, 2 * f['r_a'] * 10)
+check('its length is 30 mm', abs(f['length'] * 10 - 30.0) < 1e-6, f['length'] * 10)
+check('its facets are counted', f['segments'] == 24, f['segments'])
+c, i = prism_mesh(21, 1.0, 1.0, 40.0, (0, 0, 1), (0.0, 0.0, 0.0), centre_fan=True)
+f = M.fit_cylinder_cone(c, i)
+check('caps fanned from a centre vertex still fit', abs(2 * f['r_a'] * 10 - 2.0) < 1e-6)
+c, i = prism_mesh(32, 4.0, 2.0, 20.0, (1.0, 0.2, -0.1), (10.0, -5.0, 3.0))
+f = M.fit_cylinder_cone(c, i)
+ds = sorted((2 * f['r_a'] * 10, 2 * f['r_b'] * 10))   # the axis may point either way
+check('a cone is a cone with both diameters',
+      f['kind'] == 'cone' and abs(ds[0] - 4.0) < 1e-6 and abs(ds[1] - 8.0) < 1e-6,
+      (f['kind'], ds))
+c, i = prism_mesh(48, 10.0, 10.0, 2.0, (0, 1, 0), (0.0, 0.0, 0.0))
+f = M.fit_cylinder_cone(c, i)
+check('a short disc is still a cylinder of the right length',
+      abs(f['length'] * 10 - 2.0) < 1e-6 and abs(2 * f['r_a'] * 10 - 20.0) < 1e-6)
+c, i = prism_mesh(4, 5.0, 5.0, 10.0, (0, 0, 1), (0.0, 0.0, 0.0), phase=0.3)
+try:
+    M.fit_cylinder_cone(c, i)
+    check('a box is not a cylinder', False)
+except ValueError:
+    check('a box is not a cylinder', True)
+c, i = prism_mesh(24, 2.5, 2.5, 30.0, (0, 0, 1), (0.0, 0.0, 0.0))
+c[3 * 5 + 0] += 0.05                       # one vertex 0.5 mm out of place
+try:
+    M.fit_cylinder_cone(c, i)
+    check('a dented cylinder is refused', False)
+except ValueError:
+    check('a dented cylinder is refused', True)
+
 print()
 if FAILED:
     print('%d FAILED: %s' % (len(FAILED), ', '.join(FAILED)))
