@@ -71,6 +71,7 @@ REPAIR_MODES = [
 
 # key, label, enum
 METHODS = [
+    ('primitive', 'Cylinder / cone (analytic, any licence)', None),
     ('form', 'Organic Form (T-Spline, built-in)', None),
     ('custom_organic', 'Organic NURBS (built-in)', None),
     ('quad_cage', 'Organic Form (quad cage, size-driven)', None),
@@ -153,6 +154,9 @@ def probe_methods(comp, mesh_body):
     """
     out = {}
     for key, label, enum in METHODS:
+        if key == 'primitive':           # stdlib, needs nothing at all
+            out[key] = (True, '')
+            continue
         if enum is None:                 # ours; nothing to ask the licence about
             ok = bool(python_cmd()) and os.path.exists(ORGANIC_ENGINE)
             why = ('' if ok else 'needs a Python with numpy, scipy and trimesh; '
@@ -606,6 +610,11 @@ def run_pipeline(app, src_body, o, progress=None):
     step('Finding open boundaries')
     loops = boundary_loops(widx)
     rep['loops'] = sorted((loop_span_mm(wcoords, lp) for lp in loops), reverse=True)
+
+    if o['method_key'] == 'primitive':
+        rep['filled'], rep['left_open'] = [], []
+        return primitive_part(design, parametric, comp, src_body, wcoords, widx, o, rep,
+                              step)
 
     work_coords, work_idx = wcoords, widx
     rep['filled'], rep['left_open'] = [], []
@@ -1115,6 +1124,56 @@ def run_pipeline(app, src_body, o, progress=None):
     return rep
 
 
+def primitive_part(design, parametric, comp, src_body, wcoords, widx, o, rep, step):
+    """The analytic cylinder/cone method: fit, build, measure."""
+    step('Fitting a cylinder / cone')
+    fit = fit_cylinder_cone(wcoords, widx, float(o.get('max_error_mm', 0.1)) * 0.1)
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    pa = adsk.core.Point3D.create(*fit['p_a'])
+    pb = adsk.core.Point3D.create(*fit['p_b'])
+    tmp = tbm.createCylinderOrCone(pa, fit['r_a'], pb, fit['r_b'])
+    if tmp is None:
+        raise RuntimeError('Fusion could not build the fitted %s' % fit['kind'])
+    base = comp.features.baseFeatures.add() if parametric else None
+    if base:
+        base.startEdit()
+    try:
+        body = comp.bRepBodies.add(tmp, base) if base else comp.bRepBodies.add(tmp)
+    finally:
+        if base:
+            base.finishEdit()
+    if base:
+        body = base.bodies.item(0)
+        base.name = '%s [cylinder fit]' % src_body.name
+    body.name = '%s [part]' % src_body.name
+    step('Measuring')
+    dev = measure_deviation(comp, parametric, src_body, body, o['max_error_mm'])
+    rep['primitive'] = {
+        'kind': fit['kind'], 'diameter_a_mm': 2 * fit['r_a'] * CM,
+        'diameter_b_mm': 2 * fit['r_b'] * CM, 'length_mm': fit['length'] * CM,
+        'axis': fit['axis'], 'start_mm': [v * CM for v in fit['p_a']],
+        'residual_mm': fit['residual'] * CM, 'segments': fit['segments'],
+        'sagitta_mm': fit['sagitta'] * CM if fit['sagitta'] else None}
+    rep['attempts'] = []
+    rep['ladder'] = ['analytic fit']
+    rep['rung_used'] = 'analytic fit'
+    rep['deviation'] = dev
+    rep['is_form'] = False
+    rep['faces_out'] = body.faces.count
+    rep['solid_out'] = body.isSolid
+    rep['volume_out_mm3'] = body.volume * 1000.0
+    rep['volume_in_mm3'] = src_body.volume * 1000.0 if src_body.isClosed else None
+    rep['method_label'] = o['method_label']
+    rep['method_key'] = 'primitive'
+    rep['result'] = body.name
+    if o['hide_source']:
+        try:
+            src_body.isLightBulbOn = False
+        except Exception:
+            pass
+    return rep
+
+
 # --------------------------------------------------------------------------- #
 # report
 # --------------------------------------------------------------------------- #
@@ -1196,6 +1255,21 @@ def format_report(rep, o, secs):
              % (rep.get('method_label', o['method_label']),
                 '   (fell back from %s)' % o['method_label'].split(' (')[0]
                 if rep.get('fell_back') else ''))
+    if rep.get('primitive'):
+        pr = rep['primitive']
+        if pr['kind'] == 'cylinder':
+            L.append('  fitted            cylinder  diameter %.4f mm  length %.4f mm'
+                     % (pr['diameter_a_mm'], pr['length_mm']))
+        else:
+            L.append('  fitted            cone  diameters %.4f -> %.4f mm  length %.4f mm'
+                     % (pr['diameter_a_mm'], pr['diameter_b_mm'], pr['length_mm']))
+        L.append('  axis              (%.5f, %.5f, %.5f) from (%.3f, %.3f, %.3f) mm'
+                 % (tuple(pr['axis']) + tuple(pr['start_mm'])))
+        L.append('  mesh vertices     on it to %.5f mm' % pr['residual_mm'])
+        if pr.get('segments'):
+            L.append('  mesh facets       %d per turn: the flats sit %.4f mm inside the'
+                     % (pr['segments'], pr['sagitta_mm'] or 0.0))
+            L.append('                    circle through the vertices, which is the one built')
     if rep.get('methods_available') is not None:
         L.append('  licence allows    %s' % (', '.join(rep['methods_available'])
                                              or 'nothing'))
@@ -1778,6 +1852,185 @@ def mesh_area_mm2(coords, idx):
     return total * CM * CM
 
 
+def _jacobi3(A):
+    """Eigen-decomposition of a symmetric 3x3 (Jacobi rotations). Returns
+    (values, vectors as columns)."""
+    a = [row[:] for row in A]
+    V = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    for _ in range(60):
+        off = abs(a[0][1]) + abs(a[0][2]) + abs(a[1][2])
+        if off < 1e-15:
+            break
+        for p_, q_ in ((0, 1), (0, 2), (1, 2)):
+            if abs(a[p_][q_]) < 1e-18:
+                continue
+            th = 0.5 * math.atan2(2 * a[p_][q_], a[q_][q_] - a[p_][p_])
+            c, s_ = math.cos(th), math.sin(th)
+            for k in range(3):
+                akp, akq = a[k][p_], a[k][q_]
+                a[k][p_], a[k][q_] = c * akp - s_ * akq, s_ * akp + c * akq
+            for k in range(3):
+                apk, aqk = a[p_][k], a[q_][k]
+                a[p_][k], a[q_][k] = c * apk - s_ * aqk, s_ * apk + c * aqk
+            for k in range(3):
+                vkp, vkq = V[k][p_], V[k][q_]
+                V[k][p_], V[k][q_] = c * vkp - s_ * vkq, s_ * vkp + c * vkq
+    return [a[0][0], a[1][1], a[2][2]], V
+
+
+def _solve3(M, b):
+    """3x3 linear solve (Cramer)."""
+    def det(m):
+        return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+    d = det(M)
+    if abs(d) < 1e-30:
+        raise ValueError('singular fit')
+    out = []
+    for k in range(3):
+        m = [row[:] for row in M]
+        for r in range(3):
+            m[r][k] = b[r]
+        out.append(det(m) / d)
+    return out
+
+
+def fit_cylinder_cone(coords, idx, tol_mm=0.01):
+    """A straight cylinder or cone fitted to a CAD-style mesh (cm in, cm out).
+
+    Fusion's Prismatic conversion is what used to turn these into analytic faces,
+    and the Fusion Personal licence refuses it ("No rights for mesh conversion").
+    This needs no licence: the axis comes from the two end caps (the largest
+    pair of opposite planar groups) or, with no caps, from the side normals; the
+    axis line from a circle fit across the axis; the radius as a linear function
+    along it, so a cone is a cylinder whose radius changes. Every vertex must lie
+    on the side or on a cap to within max(tol_mm, 0.5 % of the radius), or it is
+    not a cylinder/cone and ValueError says how far off it is.
+    """
+    nv = len(coords) // 3
+    V = [(coords[3 * i], coords[3 * i + 1], coords[3 * i + 2]) for i in range(nv)]
+    T = [(idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]) for t in range(len(idx) // 3)]
+    if len(T) < 8:
+        raise ValueError('too few triangles for a cylinder')
+    sub = lambda a, b: (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+    dot = lambda a, b: a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    cross = lambda a, b: (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                          a[0] * b[1] - a[1] * b[0])
+    norm = lambda a: math.sqrt(dot(a, a))
+
+    nrm, area = [], []
+    for a, b, c in T:
+        n = cross(sub(V[b], V[a]), sub(V[c], V[a]))
+        ln = norm(n)
+        area.append(0.5 * ln)
+        nrm.append((n[0] / ln, n[1] / ln, n[2] / ln) if ln > 0 else (0.0, 0.0, 0.0))
+    total = sum(area)
+
+    # planar groups: same normal and same plane
+    groups = []                     # [normal, offset, area]
+    for t, (a, _b, _c) in enumerate(T):
+        n = nrm[t]
+        d = dot(n, V[a])
+        for g in groups:
+            if dot(g[0], n) > 0.99995 and abs(g[1] - d) < 1e-4:
+                g[2] += area[t]
+                break
+        else:
+            groups.append([n, d, area[t]])
+    groups.sort(key=lambda g: -g[2])
+    axis = None
+    for i, g in enumerate(groups[:6]):
+        for h in groups[i + 1:6]:
+            if dot(g[0], h[0]) < -0.9999 and g[2] + h[2] > 0.02 * total:
+                axis = g[0]
+                break
+        if axis:
+            break
+    if axis is None:
+        # no caps: the side normals are all perpendicular to the axis
+        S = [[0.0] * 3 for _ in range(3)]
+        for n, ar in zip(nrm, area):
+            for i in range(3):
+                for j in range(3):
+                    S[i][j] += ar * n[i] * n[j]
+        vals, vecs = _jacobi3(S)
+        k = min(range(3), key=lambda i: vals[i])
+        axis = (vecs[0][k], vecs[1][k], vecs[2][k])
+    ln = norm(axis)
+    axis = (axis[0] / ln, axis[1] / ln, axis[2] / ln)
+    helper = (1.0, 0.0, 0.0) if abs(axis[0]) < 0.9 else (0.0, 1.0, 0.0)
+    e1 = cross(axis, helper)
+    l1 = norm(e1)
+    e1 = (e1[0] / l1, e1[1] / l1, e1[2] / l1)
+    e2 = cross(axis, e1)
+
+    def circle(points):
+        """Kasa fit: x^2 + y^2 + D x + E y + F = 0."""
+        M = [[0.0] * 3 for _ in range(3)]
+        b = [0.0] * 3
+        for x, y in points:
+            row = (x, y, 1.0)
+            rhs = -(x * x + y * y)
+            for i in range(3):
+                b[i] += row[i] * rhs
+                for j in range(3):
+                    M[i][j] += row[i] * row[j]
+        D, E, F = _solve3(M, b)
+        return -D / 2.0, -E / 2.0
+
+    o0 = V[0]
+    uv = [(dot(sub(v, o0), e1), dot(sub(v, o0), e2)) for v in V]
+    cx, cy = circle(uv)
+    rr = [math.hypot(x - cx, y - cy) for x, y in uv]
+    rmax = max(rr)
+    side = [i for i in range(nv) if rr[i] > 0.1 * rmax]     # fan centres sit on the axis
+    if len(side) < 6:
+        raise ValueError('no side wall found')
+    cx, cy = circle([uv[i] for i in side])
+    centre = (o0[0] + cx * e1[0] + cy * e2[0], o0[1] + cx * e1[1] + cy * e2[1],
+              o0[2] + cx * e1[2] + cy * e2[2])
+    tt = [dot(sub(v, centre), axis) for v in V]
+    rr = [math.hypot(x - cx, y - cy) for x, y in uv]
+    # r = r0 + k t over the side vertices
+    n_ = float(len(side))
+    st = sum(tt[i] for i in side)
+    sr = sum(rr[i] for i in side)
+    stt = sum(tt[i] ** 2 for i in side)
+    str_ = sum(tt[i] * rr[i] for i in side)
+    den = n_ * stt - st * st
+    k = (n_ * str_ - st * sr) / den if abs(den) > 1e-18 else 0.0
+    r0 = (sr - k * st) / n_
+    t0, t1 = min(tt), max(tt)
+    r_a, r_b = r0 + k * t0, r0 + k * t1
+    cone = abs(r_a - r_b) > max(tol_mm * MM, 0.002 * max(r_a, r_b))
+    if not cone:
+        r_a = r_b = sr / n_
+        k = 0.0
+        r0 = r_a
+    tol = max(tol_mm * MM, 0.005 * max(r_a, r_b))
+    worst = 0.0
+    for i in range(nv):
+        e_side = abs(rr[i] - (r0 + k * tt[i]))
+        e_cap = min(abs(tt[i] - t0), abs(tt[i] - t1))
+        worst = max(worst, min(e_side, e_cap if rr[i] <= (r0 + k * tt[i]) + tol else 1e9))
+    if worst > tol:
+        raise ValueError('not a cylinder or cone: a vertex is %.4f mm off both the '
+                         'side and the end caps (allowed %.4f mm)' % (worst * CM, tol * CM))
+    # facets per turn = rim vertices on one end (rounded angles lost one to the
+    # -180/180 seam: a 22-gon read 21)
+    nseg = sum(1 for i in side if abs(tt[i] - t0) < tol)
+    if nseg < 8:
+        # a box or a hexagonal bar also has every vertex on a circle
+        raise ValueError('a %d-sided prism, not a cylinder' % nseg)
+    p_a = (centre[0] + t0 * axis[0], centre[1] + t0 * axis[1], centre[2] + t0 * axis[2])
+    p_b = (centre[0] + t1 * axis[0], centre[1] + t1 * axis[1], centre[2] + t1 * axis[2])
+    return {'kind': 'cone' if cone else 'cylinder', 'p_a': p_a, 'p_b': p_b,
+            'r_a': r_a, 'r_b': r_b, 'axis': axis, 'length': t1 - t0,
+            'residual': worst, 'segments': nseg,
+            'sagitta': (max(r_a, r_b) * (1 - math.cos(math.pi / nseg))) if nseg >= 3 else None}
+
+
 def dihedral_character(coords, idx):
     """How much of this mesh is flat. Stdlib, one pass over the edges.
 
@@ -1890,6 +2143,21 @@ def auto_parameters(body, budget_mm, avail, quad_cap=16000, log=None):
         o['repair_label'] = 'None'
 
     # ---- method ----------------------------------------------------------- #
+    # A mesh that IS a cylinder or cone gets the analytic one, on any licence.
+    # It also matters because the Personal licence refuses Prismatic, and these
+    # meshes then fell through to the organic quad cage.
+    if len(wi) // 3 <= 20000:
+        try:
+            fit = fit_cylinder_cone(wc, wi, budget_mm * 0.1)
+            o['method_key'] = 'primitive'
+            notes.append('the mesh is a %s (diameter %.4f mm, every vertex within '
+                         '%.5f mm of it): building the analytic solid'
+                         % (fit['kind'], 2 * max(fit['r_a'], fit['r_b']) * CM,
+                            fit['residual'] * CM))
+            return o, notes, None
+        except ValueError as exc:
+            notes.append('not a plain cylinder/cone (%s)' % exc)
+
     # What separates machined geometry from a scan is not flatness alone - a
     # cube is only a third coplanar, because its other edges are 90 degree
     # creases - it is that EVERY edge is one or the other. A scan is a continuum

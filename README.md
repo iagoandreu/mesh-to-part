@@ -29,9 +29,21 @@ This add-in adds two methods of its own that need no extension:
 | **Organic Form (T-Spline)** | a real **Form body**, 6 patches, editable with Fusion's sculpt tools | no |
 | **Organic NURBS** | a 6-patch NURBS solid, watertight by construction | no |
 | **Organic Form (quad cage)** | a Form body whose cage is a size-driven quad mesh, not a stretched cube | no |
-| Prismatic | Fusion's own — planes, cylinders, cones | no |
+| **Cylinder / cone** | an exact analytic cylinder or cone (3 faces) fitted to the mesh | no licence at all |
+| Prismatic | Fusion's own — planes, cylinders, cones | not on **Fusion Personal** |
 | Faceted | Fusion's own — one face per triangle, exact | no |
 | Organic | Fusion's own T-Spline conversion | **yes** |
+
+**Cylinder / cone** exists because Fusion Personal refuses Prismatic ("No rights for
+mesh conversion"), so a tessellated pin or screw axis fell through to the organic quad
+cage. It fits the axis from the two end caps (or, without caps, from the side normals),
+the axis line by a circle fit, and the radius as a linear function along it, then builds
+the solid with `TemporaryBRepManager.createCylinderOrCone`. Every vertex has to lie on the
+side or on a cap within max(budget / 10, 0.5 % of the radius), and fewer than 8 facets
+per turn is a prism, not a cylinder. The cylinder goes through the mesh vertices; the
+report says how far the flats sit inside it. Auto picks it whenever a mesh fits. On
+Dlab_155 twelve pins and screw axes came out Ø 2.0 / 2.4 / 2.5 mm, each within 0.02 mm of
+its mesh, in under a second each.
 
 Whatever the method, the budget is enforced the same way: convert, measure the
 deviation **both ways** against the source mesh, and climb an escalation ladder
