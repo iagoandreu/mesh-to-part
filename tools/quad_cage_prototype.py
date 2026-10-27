@@ -16,7 +16,7 @@ Measured on a 75k-triangle skin scan against the cube-sphere path:
 import json, math, sys, time
 import numpy as np, trimesh, pyvista as pv, gmsh
 from collections import defaultdict
-sys.path.insert(0, r'c:/Users/iandreu/Documents/Claude_iago/FusionAddIns/MeshToPart')
+sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import mtp_organic as mo
 
 HMAX = float(sys.argv[1]) if len(sys.argv) > 1 else 8.0
