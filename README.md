@@ -42,7 +42,7 @@ the solid with `TemporaryBRepManager.createCylinderOrCone`. Every vertex has to 
 side or on a cap within max(budget / 10, 0.5 % of the radius), and fewer than 8 facets
 per turn is a prism, not a cylinder. The cylinder goes through the mesh vertices; the
 report says how far the flats sit inside it. Auto picks it whenever a mesh fits. On
-Dlab_155 twelve pins and screw axes came out Ø 2.0 / 2.4 / 2.5 mm, each within 0.02 mm of
+a distal radius case, twelve pins and screw axes came out Ø 2.0 / 2.4 / 2.5 mm, each within 0.02 mm of
 its mesh, in under a second each.
 
 Whatever the method, the budget is enforced the same way: convert, measure the
