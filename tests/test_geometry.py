@@ -222,6 +222,82 @@ try:
 except ValueError:
     check('a dented cylinder is refused', True)
 
+print('box fit')
+
+
+def box_mesh(size, a1, a2, centre, split=1):
+    """A box as a CAD export would give it: each face two triangles, or a
+    split x split grid of quads (triangulated) when split > 1."""
+    def un(v):
+        ln = math.sqrt(sum(x * x for x in v))
+        return [x / ln for x in v]
+    a1 = un(a1)
+    d = sum(x * y for x, y in zip(a1, a2))
+    a2 = un([y - d * x for x, y in zip(a1, a2)])
+    a3 = [a1[1] * a2[2] - a1[2] * a2[1], a1[2] * a2[0] - a1[0] * a2[2], a1[0] * a2[1] - a1[1] * a2[0]]
+    ax = (a1, a2, a3)
+    V, T = [], []
+    for k in range(3):
+        i, j = (k + 1) % 3, (k + 2) % 3
+        for sg in (-1, 1):
+            base = len(V)
+            for p in range(split + 1):
+                for q in range(split + 1):
+                    loc = [0.0, 0.0, 0.0]
+                    loc[k] = sg * size[k] / 2
+                    loc[i] = (p / split - 0.5) * size[i]
+                    loc[j] = (q / split - 0.5) * size[j]
+                    V.append([centre[c] + sum(loc[m] * ax[m][c] for m in range(3))
+                              for c in range(3)])
+            for p in range(split):
+                for q in range(split):
+                    v0 = base + p * (split + 1) + q
+                    v1, v2, v3 = v0 + split + 1, v0 + split + 2, v0 + 1
+                    T += [(v0, v1, v2), (v0, v2, v3)] if sg > 0 else [(v0, v2, v1), (v0, v3, v2)]
+    return M.weld([c * 0.1 for v in V for c in v], [i for t in T for i in t])
+
+
+c, i = box_mesh((30.0, 20.0, 0.8), (0.267, 0.044, 0.963), (-0.298, -0.946, 0.126),
+                (-57.2, 63.2, -995.2))
+f = M.fit_primitive(c, i)
+sz = sorted(v * 10 for v in f['size'])
+check('a 30 x 20 x 0.8 cut profile far from the origin is a box',
+      f['kind'] == 'box' and all(abs(a - b) < 1e-6 for a, b in zip(sz, (0.8, 20.0, 30.0))),
+      (f['kind'], sz))
+check('its centre is found', all(abs(f['centre'][k] * 10 - v) < 1e-6
+                                for k, v in enumerate((-57.2, 63.2, -995.2))))
+a1, a2, a3 = f['axes']
+check('its axes are orthonormal and right-handed',
+      abs(sum(x * y for x, y in zip(a1, a2))) < 1e-9 and
+      abs(sum(x * y for x, y in zip(a3, (a1[1] * a2[2] - a1[2] * a2[1],
+                                         a1[2] * a2[0] - a1[0] * a2[2],
+                                         a1[0] * a2[1] - a1[1] * a2[0]))) - 1) < 1e-9)
+c, i = box_mesh((10.0, 10.0, 10.0), (1, 0, 0), (0, 1, 0), (0, 0, 0), split=4)
+f = M.fit_primitive(c, i)
+check('a finely triangulated cube is a box', f['kind'] == 'box'
+      and all(abs(v * 10 - 10.0) < 1e-6 for v in f['size']))
+c, i = box_mesh((10.0, 6.0, 4.0), (1, 0, 0), (0, 1, 0), (0, 0, 0), split=2)
+c[3 * 4 + 0] += 0.05                        # the middle vertex of the x = -5 face, 0.5 mm in
+try:
+    M.fit_primitive(c, i)
+    check('a dented box is refused', False)
+except ValueError as exc:
+    check('a dented box is refused', True, str(exc)[-60:])
+c, i = box_mesh((10.0, 6.0, 4.0), (1, 0, 0), (0, 1, 0), (0, 0, 0))
+try:
+    M.fit_box(c, i[:-6])                    # one face missing
+    check('an open box is refused', False)
+except ValueError:
+    check('an open box is refused', True)
+c, i = prism_mesh(6, 5.0, 5.0, 10.0, (0, 0, 1), (0.0, 0.0, 0.0))
+try:
+    M.fit_primitive(c, i)
+    check('a hexagonal bar is neither', False)
+except ValueError:
+    check('a hexagonal bar is neither', True)
+c, i = prism_mesh(24, 2.5, 2.5, 30.0, (0.3, 0.5, 0.8), (10.0, -5.0, 3.0))
+check('a cylinder still comes out a cylinder', M.fit_primitive(c, i)['kind'] == 'cylinder')
+
 print()
 if FAILED:
     print('%d FAILED: %s' % (len(FAILED), ', '.join(FAILED)))

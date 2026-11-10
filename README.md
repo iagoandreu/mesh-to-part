@@ -29,7 +29,7 @@ This add-in adds two methods of its own that need no extension:
 | **Organic Form (T-Spline)** | a real **Form body**, 6 patches, editable with Fusion's sculpt tools | no |
 | **Organic NURBS** | a 6-patch NURBS solid, watertight by construction | no |
 | **Organic Form (quad cage)** | a Form body whose cage is a size-driven quad mesh, not a stretched cube | no |
-| **Cylinder / cone** | an exact analytic cylinder or cone (3 faces) fitted to the mesh | no licence at all |
+| **Cylinder / cone / box** | an exact analytic cylinder or cone (3 faces) or rectangular box (6 faces) fitted to the mesh | no licence at all |
 | Prismatic | Fusion's own — planes, cylinders, cones | not on **Fusion Personal** |
 | Faceted | Fusion's own — one face per triangle, exact | no |
 | Organic | Fusion's own T-Spline conversion | **yes** |
@@ -44,6 +44,16 @@ per turn is a prism, not a cylinder. The cylinder goes through the mesh vertices
 report says how far the flats sit inside it. Auto picks it whenever a mesh fits. On
 a distal radius case, twelve pins and screw axes came out Ø 2.0 / 2.4 / 2.5 mm, each within 0.02 mm of
 its mesh, in under a second each.
+
+A **box** - a cut profile, a plate, a block, in any orientation - is tried first, because
+its test is the strict one: the three axes come from the face normals (the largest planar
+direction, the largest one square to it, their cross product), the extents from the
+vertices' spans, and then every triangle must lie on one of the six faces within budget / 10
+and each face must be covered to 0.5 % of its rectangle, so a notch, a hole, a chamfer or a
+missing face is refused. It is built with `TemporaryBRepManager.createBox`. A 30 x 20 x 0.8
+mm saw-cut profile (12 triangles, 1 m from the origin) came out a 6-face solid within
+0.0001 mm and 0.01 % of the mesh volume, in 0.8 s. A thin plate is why the box goes first:
+its four corners also lie on a circle.
 
 Whatever the method, the budget is enforced the same way: convert, measure the
 deviation **both ways** against the source mesh, and climb an escalation ladder

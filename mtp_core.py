@@ -71,7 +71,7 @@ REPAIR_MODES = [
 
 # key, label, enum
 METHODS = [
-    ('primitive', 'Cylinder / cone (analytic, any licence)', None),
+    ('primitive', 'Cylinder / cone / box (analytic, any licence)', None),
     ('form', 'Organic Form (T-Spline, built-in)', None),
     ('custom_organic', 'Organic NURBS (built-in)', None),
     ('quad_cage', 'Organic Form (quad cage, size-driven)', None),
@@ -1125,13 +1125,20 @@ def run_pipeline(app, src_body, o, progress=None):
 
 
 def primitive_part(design, parametric, comp, src_body, wcoords, widx, o, rep, step):
-    """The analytic cylinder/cone method: fit, build, measure."""
-    step('Fitting a cylinder / cone')
-    fit = fit_cylinder_cone(wcoords, widx, float(o.get('max_error_mm', 0.1)) * 0.1)
+    """The analytic cylinder/cone/box method: fit, build, measure."""
+    step('Fitting a cylinder, cone or box')
+    fit = fit_primitive(wcoords, widx, float(o.get('max_error_mm', 0.1)) * 0.1)
     tbm = adsk.fusion.TemporaryBRepManager.get()
-    pa = adsk.core.Point3D.create(*fit['p_a'])
-    pb = adsk.core.Point3D.create(*fit['p_b'])
-    tmp = tbm.createCylinderOrCone(pa, fit['r_a'], pb, fit['r_b'])
+    if fit['kind'] == 'box':
+        a1, a2, _a3 = fit['axes']
+        obb = adsk.core.OrientedBoundingBox3D.create(
+            adsk.core.Point3D.create(*fit['centre']), adsk.core.Vector3D.create(*a1),
+            adsk.core.Vector3D.create(*a2), fit['size'][0], fit['size'][1], fit['size'][2])
+        tmp = tbm.createBox(obb)
+    else:
+        pa = adsk.core.Point3D.create(*fit['p_a'])
+        pb = adsk.core.Point3D.create(*fit['p_b'])
+        tmp = tbm.createCylinderOrCone(pa, fit['r_a'], pb, fit['r_b'])
     if tmp is None:
         raise RuntimeError('Fusion could not build the fitted %s' % fit['kind'])
     base = comp.features.baseFeatures.add() if parametric else None
@@ -1144,11 +1151,18 @@ def primitive_part(design, parametric, comp, src_body, wcoords, widx, o, rep, st
             base.finishEdit()
     if base:
         body = base.bodies.item(0)
-        base.name = '%s [cylinder fit]' % src_body.name
+        base.name = '%s [%s fit]' % (src_body.name, fit['kind'])
     body.name = '%s [part]' % src_body.name
     step('Measuring')
     dev = measure_deviation(comp, parametric, src_body, body, o['max_error_mm'])
-    rep['primitive'] = {
+    if fit['kind'] == 'box':
+        rep['primitive'] = {
+            'kind': 'box', 'size_mm': [v * CM for v in fit['size']],
+            'axes': [list(a) for a in fit['axes']],
+            'centre_mm': [v * CM for v in fit['centre']],
+            'residual_mm': fit['residual'] * CM}
+    else:
+        rep['primitive'] = {
         'kind': fit['kind'], 'diameter_a_mm': 2 * fit['r_a'] * CM,
         'diameter_b_mm': 2 * fit['r_b'] * CM, 'length_mm': fit['length'] * CM,
         'axis': fit['axis'], 'start_mm': [v * CM for v in fit['p_a']],
@@ -1257,15 +1271,20 @@ def format_report(rep, o, secs):
                 if rep.get('fell_back') else ''))
     if rep.get('primitive'):
         pr = rep['primitive']
-        if pr['kind'] == 'cylinder':
+        if pr['kind'] == 'box':
+            L.append('  fitted            box  %.4f x %.4f x %.4f mm' % tuple(pr['size_mm']))
+            L.append('  centre            (%.3f, %.3f, %.3f) mm' % tuple(pr['centre_mm']))
+            L.append('  mesh triangles    on its faces to %.5f mm' % pr['residual_mm'])
+        elif pr['kind'] == 'cylinder':
             L.append('  fitted            cylinder  diameter %.4f mm  length %.4f mm'
                      % (pr['diameter_a_mm'], pr['length_mm']))
         else:
             L.append('  fitted            cone  diameters %.4f -> %.4f mm  length %.4f mm'
                      % (pr['diameter_a_mm'], pr['diameter_b_mm'], pr['length_mm']))
-        L.append('  axis              (%.5f, %.5f, %.5f) from (%.3f, %.3f, %.3f) mm'
-                 % (tuple(pr['axis']) + tuple(pr['start_mm'])))
-        L.append('  mesh vertices     on it to %.5f mm' % pr['residual_mm'])
+        if pr['kind'] != 'box':
+            L.append('  axis              (%.5f, %.5f, %.5f) from (%.3f, %.3f, %.3f) mm'
+                     % (tuple(pr['axis']) + tuple(pr['start_mm'])))
+            L.append('  mesh vertices     on it to %.5f mm' % pr['residual_mm'])
         if pr.get('segments'):
             L.append('  mesh facets       %d per turn: the flats sit %.4f mm inside the'
                      % (pr['segments'], pr['sagitta_mm'] or 0.0))
@@ -2031,6 +2050,111 @@ def fit_cylinder_cone(coords, idx, tol_mm=0.01):
             'sagitta': (max(r_a, r_b) * (1 - math.cos(math.pi / nseg))) if nseg >= 3 else None}
 
 
+def fit_box(coords, idx, tol_mm=0.01):
+    """A rectangular box fitted to a CAD-style mesh (cm in, cm out), in any
+    orientation - a cut profile, a plate, a block.
+
+    The three axes come from the face normals: the largest planar direction,
+    then the largest one square to it, then their cross product. The extents are
+    the vertices' spans along them. Every triangle must lie on one of the six
+    faces to within tol_mm, and the six faces must be covered (their triangles'
+    area within 0.5 % of the box's), so a notch, a hole, a chamfer or a missing
+    face is refused with ValueError saying what is off.
+    """
+    nv = len(coords) // 3
+    V = [(coords[3 * i], coords[3 * i + 1], coords[3 * i + 2]) for i in range(nv)]
+    T = [(idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]) for t in range(len(idx) // 3)]
+    if len(T) < 12:
+        raise ValueError('too few triangles for a box')
+    sub = lambda a, b: (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+    dot = lambda a, b: a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    cross = lambda a, b: (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                          a[0] * b[1] - a[1] * b[0])
+    norm = lambda a: math.sqrt(dot(a, a))
+    unit = lambda a: (a[0] / norm(a), a[1] / norm(a), a[2] / norm(a))
+
+    nrm, area = [], []
+    for a, b, c in T:
+        n = cross(sub(V[b], V[a]), sub(V[c], V[a]))
+        ln = norm(n)
+        area.append(0.5 * ln)
+        nrm.append((n[0] / ln, n[1] / ln, n[2] / ln) if ln > 0 else (0.0, 0.0, 0.0))
+    total = sum(area)
+    # directions up to sign, each an area-weighted sum of its normals
+    dirs = []                       # [sum vector, area]
+    for n, ar in zip(nrm, area):
+        if ar <= 0:
+            continue
+        for d in dirs:
+            u = unit(d[0])
+            c = dot(u, n)
+            if abs(c) > 0.9995:
+                sg = 1.0 if c > 0 else -1.0
+                d[0] = (d[0][0] + sg * ar * n[0], d[0][1] + sg * ar * n[1],
+                        d[0][2] + sg * ar * n[2])
+                d[1] += ar
+                break
+        else:
+            dirs.append([(ar * n[0], ar * n[1], ar * n[2]), ar])
+    if len(dirs) != 3:
+        raise ValueError('%d face directions, a box has 3' % len(dirs))
+    dirs.sort(key=lambda d: -d[1])
+    a1 = unit(dirs[0][0])
+    u2, u3 = unit(dirs[1][0]), unit(dirs[2][0])
+    c12 = dot(u2, a1)
+    a2 = unit((u2[0] - c12 * a1[0], u2[1] - c12 * a1[1], u2[2] - c12 * a1[2]))
+    a3 = cross(a1, a2)
+    # within 1 degree of square; the vertex check below is the real tolerance
+    if abs(c12) > 0.0175 or abs(dot(u3, a3)) < 0.99985:
+        raise ValueError('the face directions are not square to each other')
+    axes = (a1, a2, a3)
+    proj = [[dot(v, a) for v in V] for a in axes]
+    lo = [min(pk) for pk in proj]
+    hi = [max(pk) for pk in proj]
+    size = [hi[k] - lo[k] for k in range(3)]
+    if min(size) <= 0:
+        raise ValueError('a flat mesh, not a box')
+    tol = tol_mm * MM
+    worst = 0.0
+    face_area = [[0.0, 0.0] for _ in range(3)]
+    for t, (a, b, c) in enumerate(T):
+        if area[t] <= 0:
+            continue
+        k = max(range(3), key=lambda j: abs(dot(nrm[t], axes[j])))
+        mid = (proj[k][a] + proj[k][b] + proj[k][c]) / 3.0
+        side = 1 if abs(mid - hi[k]) < abs(mid - lo[k]) else 0
+        plane = hi[k] if side else lo[k]
+        off = max(abs(proj[k][i] - plane) for i in (a, b, c))
+        worst = max(worst, off)
+        face_area[k][side] += area[t]
+    if worst > tol:
+        raise ValueError('not a box: a triangle is %.4f mm off the nearest face '
+                         '(allowed %.4f mm)' % (worst * CM, tol * CM))
+    for k in range(3):
+        want = size[(k + 1) % 3] * size[(k + 2) % 3]
+        for side in (0, 1):
+            if abs(face_area[k][side] - want) > 0.005 * want:
+                raise ValueError('not a box: a face covers %.1f %% of its rectangle'
+                                 % (100.0 * face_area[k][side] / want))
+    mid = [0.5 * (lo[k] + hi[k]) for k in range(3)]
+    centre = tuple(sum(mid[k] * axes[k][i] for k in range(3)) for i in range(3))
+    return {'kind': 'box', 'centre': centre, 'axes': axes, 'size': size,
+            'residual': worst, 'length': max(size)}
+
+
+def fit_primitive(coords, idx, tol_mm=0.01):
+    """A box, cylinder or cone, whichever the mesh is; ValueError with both reasons.
+    The box goes first: its test is the strict one (every triangle on a face, every
+    face covered), while a thin plate's four corners also lie on a circle."""
+    try:
+        return fit_box(coords, idx, tol_mm)
+    except ValueError as exc_b:
+        try:
+            return fit_cylinder_cone(coords, idx, tol_mm)
+        except ValueError as exc_c:
+            raise ValueError('%s; %s' % (exc_c, exc_b))
+
+
 def dihedral_character(coords, idx):
     """How much of this mesh is flat. Stdlib, one pass over the edges.
 
@@ -2143,20 +2267,22 @@ def auto_parameters(body, budget_mm, avail, quad_cap=16000, log=None):
         o['repair_label'] = 'None'
 
     # ---- method ----------------------------------------------------------- #
-    # A mesh that IS a cylinder or cone gets the analytic one, on any licence.
-    # It also matters because the Personal licence refuses Prismatic, and these
-    # meshes then fell through to the organic quad cage.
+    # A mesh that IS a cylinder, cone or box gets the analytic one, on any
+    # licence. It also matters because the Personal licence refuses Prismatic,
+    # and these meshes then fell through to the organic quad cage.
     if len(wi) // 3 <= 20000:
         try:
-            fit = fit_cylinder_cone(wc, wi, budget_mm * 0.1)
+            fit = fit_primitive(wc, wi, budget_mm * 0.1)
             o['method_key'] = 'primitive'
-            notes.append('the mesh is a %s (diameter %.4f mm, every vertex within '
-                         '%.5f mm of it): building the analytic solid'
-                         % (fit['kind'], 2 * max(fit['r_a'], fit['r_b']) * CM,
-                            fit['residual'] * CM))
+            what = ('box %.4f x %.4f x %.4f mm' % tuple(v * CM for v in fit['size'])
+                    if fit['kind'] == 'box' else
+                    '%s (diameter %.4f mm)' % (fit['kind'],
+                                               2 * max(fit['r_a'], fit['r_b']) * CM))
+            notes.append('the mesh is a %s, every vertex within %.5f mm of it: '
+                         'building the analytic solid' % (what, fit['residual'] * CM))
             return o, notes, None
         except ValueError as exc:
-            notes.append('not a plain cylinder/cone (%s)' % exc)
+            notes.append('not a plain cylinder, cone or box (%s)' % exc)
 
     # What separates machined geometry from a scan is not flatness alone - a
     # cube is only a third coplanar, because its other edges are 90 degree
