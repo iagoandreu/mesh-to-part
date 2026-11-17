@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 $cache = Join-Path $dst '__pycache__'
 if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Recurse -Force }
 
-foreach ($f in @('MeshToPart.py', 'mtp_core.py', 'mtp_organic.py', 'mtp_wrap.py', 'MeshToPart.manifest')) {
+foreach ($f in @('MeshToPart.py', 'mtp_core.py', 'mtp_organic.py', 'mtp_wrap.py', 'mtp_remesh.py', 'MeshToPart.manifest')) {
     Copy-Item -LiteralPath (Join-Path $src $f) -Destination $dst -Force
 }
 # Copy-Item -Recurse into a directory that ALREADY holds one of the same name

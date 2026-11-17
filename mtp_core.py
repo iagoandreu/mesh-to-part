@@ -72,6 +72,7 @@ REPAIR_MODES = [
 # key, label, enum
 METHODS = [
     ('primitive', 'Cylinder / cone / box (analytic, any licence)', None),
+    ('remesh', 'Organic Form (quad remesh)', None),
     ('form', 'Organic Form (T-Spline, built-in)', None),
     ('custom_organic', 'Organic NURBS (built-in)', None),
     ('quad_cage', 'Organic Form (quad cage, size-driven)', None),
@@ -83,6 +84,10 @@ METHODS = [
      adsk.fusion.MeshConvertMethodTypes.FacetedMeshConvertMethodType),
 ]
 METHOD_BY_KEY = {k: (lab, en) for k, lab, en in METHODS}
+
+# The earlier organic methods, superseded by 'remesh': it is the one organic
+# method in the list. Their code stays for the dev bridge and Wrap's NURBS.
+RETIRED_METHODS = ('form', 'custom_organic', 'quad_cage')
 
 RESOLUTIONS = ['Auto from max error', 'Low', 'Medium', 'High', 'Precise', 'By face count']
 
@@ -124,6 +129,25 @@ def has_instant():
     return _INSTANT_OK
 
 
+_MODULES_OK = {}
+
+
+def has_modules(names):
+    """Are these modules importable in the engine's interpreter? Cached."""
+    key = tuple(names)
+    if key not in _MODULES_OK:
+        import subprocess
+        exe = python_cmd()
+        try:
+            r = subprocess.run(exe + ['-c', 'import ' + ', '.join(names)],
+                               capture_output=True, timeout=90,
+                               creationflags=NO_WINDOW) if exe else None
+            _MODULES_OK[key] = bool(r is not None and r.returncode == 0)
+        except Exception:
+            _MODULES_OK[key] = False
+    return _MODULES_OK[key]
+
+
 def default_cage_source():
     return 'instant' if has_instant() else 'scan'
 
@@ -156,6 +180,14 @@ def probe_methods(comp, mesh_body):
     for key, label, enum in METHODS:
         if key == 'primitive':           # stdlib, needs nothing at all
             out[key] = (True, '')
+            continue
+        if key == 'remesh':
+            ok = (bool(python_cmd()) and os.path.exists(REMESH_ENGINE)
+                  and has_modules(('numpy', 'scipy', 'trimesh', 'open3d',
+                                   'pynanoinstantmeshes')))
+            out[key] = (ok, '' if ok else
+                        'needs a Python with numpy, scipy, trimesh, open3d and '
+                        'PyNanoInstantMeshes; see python_path.txt')
             continue
         if enum is None:                 # ours; nothing to ask the licence about
             ok = bool(python_cmd()) and os.path.exists(ORGANIC_ENGINE)
@@ -1439,6 +1471,7 @@ DEFAULTS = {
     'quadSize': 2.0, 'quadCurv': 16, 'cageSource': 0,
     'cageAuto': True,
     'fallbackFaceted': True,
+    'remeshSize': 0.0, 'remeshOffset': 0.0,
 }
 
 
@@ -1519,6 +1552,14 @@ def build_inputs(inputs, s):
                                     int(s['faceCount']))
     c.addIntegerSpinnerCommandInput('facetedCap', 'Faceted: cap faces at', 500, 500000,
                                     1000, int(s['facetedCap']))
+    rs = c.addValueInput('remeshSize', 'Element size (0 = auto)', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['remeshSize']) * MM))
+    rs.tooltip = ('Edge length of the Form\'s quads. Auto: about 8000 quads over the '
+                  'surface, finer if the p99 is over the maximum error.')
+    ro = c.addValueInput('remeshOffset', 'Offset (0 = none)', 'mm',
+                         adsk.core.ValueInput.createByReal(float(s['remeshOffset']) * MM))
+    ro.tooltip = ('Builds the body this far outside the mesh (negative: inside), '
+                  'along the surface normal - e.g. 0.2 for a clearance body.')
     c.addBoolValueInput('cageAuto', 'Organic: cage from the error budget',
                         True, '', s['cageAuto'])
     c.addIntegerSpinnerCommandInput('cage', 'Organic: cage per face', 8, 72, 4,
@@ -1594,9 +1635,9 @@ def populate_methods(inputs, comp, mesh_body, preferred):
     avail = probe_methods(comp, mesh_body)
     dd = inputs.itemById('method')
     dd.listItems.clear()
-    keys = [k for k, _l, _e in METHODS if avail[k][0]]
+    keys = [k for k, _l, _e in METHODS if avail[k][0] and k not in RETIRED_METHODS]
     if not keys:                          # should not happen; keep the dialog usable
-        keys = [k for k, _l, _e in METHODS]
+        keys = [k for k, _l, _e in METHODS if k not in RETIRED_METHODS]
     for i, key in enumerate(keys):
         want = (key == preferred) if preferred in keys else (i == 0)
         dd.listItems.add(METHOD_BY_KEY[key][0], want)
@@ -1632,6 +1673,22 @@ def selected_method_key(inputs):
 
 def refresh_visibility(inputs):
     key = selected_method_key(inputs)
+    remesh = key == 'remesh'
+    inputs.itemById('remeshSize').isVisible = remesh
+    inputs.itemById('remeshOffset').isVisible = remesh
+    if remesh:
+        # one engine call: no Fusion mesh features, no ladder of conversions, the
+        # body is always measured, and there is nothing to fall back from
+        for cid in ('resolution', 'faceCount', 'facetedCap', 'cageAuto', 'cage',
+                    'fairness', 'relaxIters', 'ctrlRatio', 'aspectLimit', 'aspectPasses',
+                    'squarePasses', 'minEdge', 'quadSize', 'cageSource', 'quadCurv',
+                    'preprocessHoles', 'escalate', 'maxAttempts', 'faceGroups',
+                    'featureAngle', 'minGroup', 'repair', 'rebuildDensity', 'reduce',
+                    'reduceOver', 'reduceShare', 'smoothPasses', 'wrapOffset',
+                    'wrapClose', 'opType', 'verify', 'fallbackFaceted', 'maxGap',
+                    'fillAll'):
+            inputs.itemById(cid).isVisible = False
+        return
     organic = key == 'organic'
     prismatic = key == 'prismatic'
     res = inputs.itemById('resolution')
@@ -1730,6 +1787,8 @@ def resolve_options(inputs):
         'verify': inputs.itemById('verify').value,
         'hide_source': inputs.itemById('hideSource').value,
         'show_report': inputs.itemById('showReport').value,
+        'remesh_size_mm': inputs.itemById('remeshSize').value * CM,
+        'remesh_offset_mm': inputs.itemById('remeshOffset').value * CM,
     }
 
 
@@ -1775,6 +1834,8 @@ def settings_from(inputs):
         'verify': inputs.itemById('verify').value,
         'hideSource': inputs.itemById('hideSource').value,
         'showReport': inputs.itemById('showReport').value,
+        'remeshSize': inputs.itemById('remeshSize').value * CM,
+        'remeshOffset': inputs.itemById('remeshOffset').value * CM,
     }
 
 
@@ -2312,6 +2373,12 @@ def auto_parameters(body, budget_mm, avail, quad_cap=16000, log=None):
                      'can close, and the organic methods need a closed surface')
         o['method_key'] = 'faceted' if ok('faceted') else 'prismatic'
         return o, notes, None
+    if ok('remesh'):
+        o['method_key'] = 'remesh'
+        notes.append('Organic Form (quad remesh): the element size is chosen by the '
+                     'engine from the surface area and refined if the p99 is over '
+                     'the maximum error')
+        return o, notes, None
     if not ok('quad_cage'):
         o['method_key'] = ('form' if ok('form')
                            else 'faceted' if ok('faceted') else 'prismatic')
@@ -2565,11 +2632,17 @@ def on_execute(app, ui, inputs):
     o = resolve_options(inputs)
     save_settings(settings_from(inputs))
     bodies = selected_bodies(inputs.itemById('selMesh'))
+    if o['method_key'] == 'remesh':
+        # the remesh takes solids too (a Form to offset, say)
+        sel = inputs.itemById('selMesh')
+        bodies = [sel.selection(i).entity for i in range(sel.selectionCount)]
     if not bodies:
         ui.messageBox('No mesh body selected.', 'Mesh to Part')
         return
 
     progress = ui.createProgressDialog()
+    # hidden by default in Fusion - the reason Cancel never did anything
+    progress.isCancelButtonShown = True
     progress.show('Mesh to Part', 'Starting', 0, len(bodies), 0)
     reports, failed = [], []
     t0 = time.time()
@@ -2577,8 +2650,15 @@ def on_execute(app, ui, inputs):
         progress.progressValue = n
         log('=== %s (%s) ===' % (b.name, o['method_key']))
         try:
-            rep = run_pipeline(app, b, o, progress)
-            reports.append(format_report(rep, o, time.time() - t0))
+            if o['method_key'] == 'remesh':
+                rep = remesh_part(app, b, o, progress)
+                reports.append(format_remesh_report(rep))
+            else:
+                rep = run_pipeline(app, b, o, progress)
+                reports.append(format_report(rep, o, time.time() - t0))
+        except Cancelled:
+            reports.append('%s: cancelled; nothing was left in the design.' % b.name)
+            break
         except Exception:
             tb = traceback.format_exc()
             log(tb)
@@ -2874,6 +2954,7 @@ def dev_options(over):
         'op_type': adsk.fusion.MeshConvertOperationTypes
                    .ParametricFeatureMeshConvertOperationType,
         'verify': True, 'hide_source': True, 'show_report': False,
+        'remesh_size_mm': 0.0, 'remesh_offset_mm': 0.0,
     }
     if 'feature_angle_deg' in over:
         o['feature_angle_rad'] = math.radians(float(over.pop('feature_angle_deg')))
@@ -3109,10 +3190,18 @@ def on_wrap_execute(app, ui, inputs):
             'max_error_mm': 1.0, 'verify': True, 'hide_source': True,
             'show_report': False,
         })
+        if out_idx == 1 and probe_methods(mesh_body.parentComponent, mesh_body)['remesh'][0]:
+            o['method_key'] = 'remesh'
+            o['max_error_mm'] = 0.1
         try:
-            rep = run_pipeline(app, mesh_body, o, None)
-            lines.append('')
-            lines.append(format_report(rep, o, time.time() - t0))
+            if o['method_key'] == 'remesh':
+                rep = remesh_part(app, mesh_body, o, None)
+                lines.append('')
+                lines.append(format_remesh_report(rep))
+            else:
+                rep = run_pipeline(app, mesh_body, o, None)
+                lines.append('')
+                lines.append(format_report(rep, o, time.time() - t0))
         except Exception:
             lines.append('')
             lines.append('  the solid conversion failed: %s'
@@ -3541,6 +3630,7 @@ def dev_export_mesh(app, job):
 # --------------------------------------------------------------------------- #
 
 ORGANIC_ENGINE = os.path.join(ADDIN_DIR, 'mtp_organic.py')
+REMESH_ENGINE = os.path.join(ADDIN_DIR, 'mtp_remesh.py')
 WRAP_ENGINE = os.path.join(ADDIN_DIR, 'mtp_wrap.py')
 
 
@@ -3980,6 +4070,321 @@ def organic_form_body(app, src_body, params, log_lines):
     return body, res, ff
 
 
+class Cancelled(Exception):
+    pass
+
+
+def run_engine_cancellable(script, job, progress, timeout=900):
+    """Run an engine script in the external Python WITHOUT blocking Fusion.
+
+    subprocess.run held the main thread for the whole fit, so Fusion could not
+    repaint, and the progress dialog's Cancel (which Fusion hides by default
+    anyway) could never be read. Here the engine runs as its own process, the
+    loop keeps Fusion's events moving, shows the engine's progress line, and
+    kills the process the moment Cancel is pressed."""
+    import subprocess
+    exe = python_cmd()
+    if not exe:
+        raise RuntimeError(
+            'No Python with numpy, scipy and trimesh was found. Set the '
+            'MESHTOPART_PYTHON environment variable, or put the full path to the '
+            'interpreter in python_path.txt next to the add-in.')
+    work = os.path.join(ADDIN_DIR, 'devjobs')
+    os.makedirs(work, exist_ok=True)
+    stem = os.path.join(work, 'remesh_%d' % int(time.time() * 1000))
+    jp, op, pp, ep = stem + '_job.json', stem + '_out.json', stem + '_progress.txt', \
+        stem + '_stderr.txt'
+    with open(jp, 'w', encoding='utf-8') as fh:
+        json.dump(dict(job, progress=pp), fh)
+    t0 = time.time()
+    shown = None
+    with open(ep, 'w') as err:
+        proc = subprocess.Popen(exe + [script, jp, op], stdout=subprocess.DEVNULL,
+                                stderr=err, creationflags=NO_WINDOW)
+        try:
+            while proc.poll() is None:
+                adsk.doEvents()
+                if progress is not None and progress.wasCancelled:
+                    raise Cancelled()
+                if time.time() - t0 > timeout:
+                    raise RuntimeError('the engine took longer than %d s' % timeout)
+                try:
+                    with open(pp, encoding='utf-8') as fh:
+                        msg = fh.read().strip()
+                except OSError:
+                    msg = ''
+                line = '%s   %d s' % (msg or 'Working', int(time.time() - t0))
+                if progress is not None and line != shown:
+                    progress.message = line
+                    shown = line
+                time.sleep(0.05)
+        except BaseException:
+            proc.kill()
+            proc.wait(10)
+            raise
+    try:
+        with open(op, encoding='utf-8') as fh:
+            res = json.load(fh)
+    except OSError:
+        with open(ep, encoding='utf-8', errors='replace') as fh:
+            raise RuntimeError('the engine produced nothing (rc=%s)\n%s'
+                               % (proc.returncode, fh.read()[-1200:]))
+    finally:
+        for f in (jp, pp, ep):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    try:
+        os.remove(op)
+    except OSError:
+        pass
+    if not res.get('ok'):
+        raise RuntimeError('the engine failed:\n%s' % res.get('error', '')[-1200:])
+    return res
+
+
+def _write_bins(stem, coords_cm, idx):
+    import array
+    with open(stem + '_v.bin', 'wb') as fh:
+        array.array('d', [v * CM for v in coords_cm]).tofile(fh)
+    with open(stem + '_f.bin', 'wb') as fh:
+        array.array('i', idx).tofile(fh)
+    return stem + '_v.bin', stem + '_f.bin'
+
+
+def remesh_part(app, src_body, o, progress=None):
+    """Organic Form (quad remesh): the triangles straight to the engine, the cage
+    back as ONE Form feature, that body tessellated and measured against the
+    triangles. No working copy and no Fusion mesh features, so a cancel or a
+    failure leaves nothing behind, and every wait can be cancelled."""
+    t0 = time.time()
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    if not is_parametric(des):
+        raise RuntimeError(
+            'A Form (T-Spline) body needs a parametric design, and this one has '
+            'design history captured off. Turn it on (right-click the document '
+            'name in the browser, "Capture Design History").')
+    comp = src_body.parentComponent
+    rep = {'source': src_body.name, 'version': VERSION, 'warnings': []}
+
+    def step(msg):
+        log('  ' + msg)
+        if progress is not None:
+            progress.message = msg
+            adsk.doEvents()
+            if progress.wasCancelled:
+                raise Cancelled()
+
+    step('Reading the triangles')
+    if adsk.fusion.BRepBody.cast(src_body):
+        mc = src_body.meshManager.createMeshCalculator()
+        mc.surfaceTolerance = 0.002          # 0.02 mm
+        tm = mc.calculate()
+        coords, idx = list(tm.nodeCoordinatesAsDouble), list(tm.nodeIndices)
+    else:
+        coords, idx = read_triangles(src_body)
+    rep['tri_in'] = len(idx) // 3
+    work = os.path.join(ADDIN_DIR, 'devjobs')
+    os.makedirs(work, exist_ok=True)
+    stem = os.path.join(work, 'remesh_mesh_%d' % int(time.time() * 1000))
+    vpath, fpath = _write_bins(stem, coords, idx)
+    tsm = stem + '.tsm'
+    made = []
+    try:
+        res = run_engine_cancellable(REMESH_ENGINE, {
+            'v': vpath, 'f': fpath, 'tsm': tsm,
+            'element_mm': float(o.get('remesh_size_mm', 0.0)),
+            'offset_mm': float(o.get('remesh_offset_mm', 0.0)),
+            'budget_mm': float(o['max_error_mm']),
+            'fill_gaps': bool(o.get('fill_gaps', True)), 'time_s': 60.0}, progress)
+        rep['engine'] = res
+
+        step('Building the Form body')
+        try:
+            des.timeline.moveToEnd()
+        except Exception:
+            pass
+        with open(tsm, encoding='utf-8') as fh:
+            text = fh.read()
+        t1 = time.time()
+        ff = comp.features.formFeatures.add()
+        made.append(ff)
+        ff.startEdit()
+        try:
+            tb = ff.tSplineBodies.addByTSMDescription(text)
+        finally:
+            ff.finishEdit()
+        if tb is None or ff.bodies.count == 0:
+            raise RuntimeError('Fusion did not accept the cage (self-intersecting?)')
+        body = ff.bodies.item(0)
+        off = float(o.get('remesh_offset_mm', 0.0))
+        body.name = ('%s [part]' % src_body.name if not off
+                     else '%s [offset %+.2f]' % (src_body.name, off))
+        rep['body'] = body.name
+        rep['form_s'] = round(time.time() - t1, 1)
+        rep.update({'faces': body.faces.count, 'solid': body.isSolid,
+                    'volume_mm3': body.volume * 1000.0 if body.isSolid else None})
+
+        step('Measuring the body')
+        mc = body.meshManager.createMeshCalculator()
+        mc.surfaceTolerance = 0.001          # 0.01 mm
+        tm = mc.calculate()
+        pv, pf = _write_bins(stem + '_part', list(tm.nodeCoordinatesAsDouble),
+                             list(tm.nodeIndices))
+        if off:
+            # an offset body is measured against the mesh it was offset from:
+            # the distance should read the offset everywhere
+            rep['measure_note'] = 'distances include the %+.2f mm offset' % off
+        rep['measured'] = run_engine_cancellable(REMESH_ENGINE, {
+            'mode': 'measure', 'v': vpath, 'f': fpath, 'part_v': pv, 'part_f': pf},
+            progress)
+    except BaseException:
+        for f in reversed(made):
+            try:
+                f.deleteMe()
+            except Exception:
+                pass
+        raise
+    finally:
+        for f in (vpath, fpath, tsm, stem + '_part_v.bin', stem + '_part_f.bin'):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    if o.get('hide_source', True):
+        try:
+            src_body.isLightBulbOn = False
+        except Exception:
+            pass
+    rep['budget_mm'] = float(o['max_error_mm'])
+    rep['secs'] = round(time.time() - t0, 1)
+    return rep
+
+
+def format_remesh_report(rep):
+    e = rep['engine']
+    m = rep.get('measured') or {}
+    lines = ['%s  ->  %s' % (rep['source'], rep.get('body', '?')), '',
+             'INPUT', '  triangles         %d' % rep['tri_in'], '',
+             'CONVERSION',
+             '  method            Organic Form (quad remesh)',
+             '  element           %.2f mm, %d quads, %d extraordinary vertices'
+             % (e['element_mm'], e['quads'], e['extraordinary']),
+             '  B-Rep faces       %d   solid %s' % (rep.get('faces', 0), rep.get('solid')),
+             '  volume            %.1f mm3  (mesh %.1f mm3, %+.3f %%)'
+             % (rep.get('volume_mm3') or 0.0, e['mesh_volume_mm3'],
+                100.0 * ((rep.get('volume_mm3') or 0.0) / e['mesh_volume_mm3'] - 1.0)),
+             '  engine            %.1f s   Form %.1f s' % (e['secs'], rep.get('form_s', 0.0))]
+    if len(e.get('tries', [])) > 1:
+        lines.append('  tried             ' + ' -> '.join(
+            '%.2f mm (p99 %.3f)' % (t['element_mm'], t['p99_mm']) for t in e['tries']))
+    if e.get('offset'):
+        f = e['offset']
+        lines.append('  offset            %+.3f mm asked, achieved mean %.4f  min %.4f  '
+                     'max %.4f mm' % (f['asked_mm'], f['mean_mm'], f['min_mm'], f['max_mm']))
+    if e.get('folded_quads'):
+        lines.append('  note              %d control quads fold; Fusion accepted the body'
+                     % e['folded_quads'])
+    if m:
+        a, b = m['part_to_mesh'], m['mesh_to_part']
+        lines += ['', 'MEASURED DEVIATION of the Fusion body vs the mesh'
+                  + (' (%s)' % rep['measure_note'] if rep.get('measure_note') else ''),
+                  '  part -> mesh  max %.4f   p99 %.4f   p95 %.4f   rms %.4f mm'
+                  % (a['max'], a['p99'], a['p95'], a['rms']),
+                  '  mesh -> part  max %.4f   p99 %.4f   p95 %.4f   rms %.4f mm'
+                  % (b['max'], b['p99'], b['p95'], b['rms'])]
+        if not rep.get('measure_note'):
+            lines.append('  RESULT: p99 %.4f mm, %s the %.4f mm maximum error'
+                         % (m['worst_p99'], 'within' if m['worst_p99'] <= rep['budget_mm']
+                            else 'OVER', rep['budget_mm']))
+        for sp in m.get('spots', []):
+            lines.append('  worst spot %.3f mm at (%.1f, %.1f, %.1f) mm, %d points'
+                         % (sp['dev_mm'], sp['at_mm'][0], sp['at_mm'][1], sp['at_mm'][2],
+                            sp['points']))
+    lines += ['', 'elapsed %.1f s   MeshToPart %s' % (rep['secs'], rep['version'])]
+    return '\n'.join(lines)
+
+
+def dev_remesh(app, job):
+    """Organic Form (quad remesh) of a named body in the ACTIVE document; used on
+    scratch documents by the tests."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    found = []
+    collect_brep_bodies(des.rootComponent, found)
+    collect_mesh_bodies(des.rootComponent, found)
+    src = next((b for b in found if b.name == job['body']), None)
+    if src is None:
+        return {'error': 'body %r not found' % job['body']}
+    o = dev_options(dict({'method_key': 'remesh'}, **job.get('options', {})))
+    rep = remesh_part(app, src, o, None)
+    return {'report': format_remesh_report(rep), 'rep': {k: v for k, v in rep.items()
+                                                          if k != 'engine'}}
+
+
+def dev_remesh_test(app, job):
+    """Copy named mesh bodies of the active document into a NEW document and run the
+    remesh on each there (options per body), optionally cancelling after
+    cancel_after_s through a stand-in progress dialog. Reports, timings, what the
+    design holds afterwards; the document is closed unsaved unless keep. The
+    active document is only read. Refused while Fusion is busy."""
+    ui = app.userInterface
+    if ui.activeCommand != 'SelectCommand':
+        return {'refused': 'Fusion is busy (%s)' % ui.activeCommand}
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    found = []
+    collect_mesh_bodies(des.rootComponent, found)
+    collect_brep_bodies(des.rootComponent, found)
+    data = []
+    for item in job['runs']:
+        b = next((x for x in found if x.name == item['body']), None)
+        if b is None:
+            return {'error': 'no body %r' % item['body']}
+        data.append(read_triangles(b) if adsk.fusion.MeshBody.cast(b) else None)
+    prev = app.activeDocument
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    out = []
+    try:
+        des2 = adsk.fusion.Design.cast(app.activeProduct)
+        if not is_parametric(des2):
+            des2.designType = adsk.fusion.DesignTypes.ParametricDesignType
+        comp = des2.rootComponent
+        for item, (coords, idx) in zip(job['runs'], data):
+            body, _b, _n = add_mesh_body(comp, True, coords, idx, item['body'])
+
+            class _Fake(object):
+                def __init__(self, after):
+                    self.t0, self.after, self.message = time.time(), after, ''
+
+                @property
+                def wasCancelled(self):
+                    return self.after is not None and time.time() - self.t0 > self.after
+
+            fake = _Fake(item.get('cancel_after_s'))
+            o = dev_options(dict({'method_key': 'remesh'}, **item.get('options', {})))
+            t0 = time.time()
+            row = {'body': item['body']}
+            try:
+                rep = remesh_part(app, body, o, fake)
+                row['report'] = format_remesh_report(rep)
+                row['faces'] = rep.get('faces')
+            except Cancelled:
+                row['cancelled_after_s'] = round(time.time() - t0, 2)
+                row['last_message'] = fake.message
+            except Exception:
+                row['error'] = short_error(traceback.format_exc())
+            row['secs'] = round(time.time() - t0, 1)
+            row['design_after'] = {'brep': comp.bRepBodies.count,
+                                   'forms': comp.features.formFeatures.count}
+            out.append(row)
+    finally:
+        if not job.get('keep'):
+            doc.close(False)
+            if prev:
+                prev.activate()
+    return out
+
+
 def dev_visibility(app, job):
     """Show or hide bodies by name fragment, so documentation shots can be set up."""
     des = adsk.fusion.Design.cast(app.activeProduct)
@@ -4036,6 +4441,66 @@ def _pick_body(found, job):
         raise RuntimeError('body %r not found. Available: %s'
                            % (want, ', '.join(b.name for b in found) or 'none'))
     return found[0]
+
+
+def dev_form_lab(app, job):
+    """Scratch document only: Form bodies from TSM files, each timed (parse, finish),
+    with the B-Rep it converts to (faces, solid, volume) and, if asked, its
+    tessellation written to <path>_v/_f.bin for measuring outside. The document is
+    closed unsaved unless keep. Refused while Fusion is busy."""
+    import array
+    ui = app.userInterface
+    if ui.activeCommand != 'SelectCommand':
+        return {'refused': 'Fusion is busy (%s)' % ui.activeCommand}
+    prev = app.activeDocument
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    out = []
+    try:
+        des = adsk.fusion.Design.cast(app.activeProduct)
+        if not is_parametric(des):
+            des.designType = adsk.fusion.DesignTypes.ParametricDesignType
+        comp = des.rootComponent
+        for path in job['paths']:
+            row = {'path': os.path.basename(path)}
+            out.append(row)
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    text = fh.read()
+                t0 = time.time()
+                ff = comp.features.formFeatures.add()
+                ff.startEdit()
+                tb = ff.tSplineBodies.addByTSMDescription(text)
+                row['parse_s'] = round(time.time() - t0, 2)
+                t1 = time.time()
+                ff.finishEdit()
+                row['finish_s'] = round(time.time() - t1, 2)
+                body = ff.bodies.item(0) if ff.bodies.count else None
+                if body is None:
+                    row['error'] = 'no body'
+                    continue
+                row.update({'faces': body.faces.count, 'edges': body.edges.count,
+                            'solid': body.isSolid,
+                            'volume_mm3': round(body.volume * 1000.0, 1)})
+                if job.get('tessellate'):
+                    t2 = time.time()
+                    mc = body.meshManager.createMeshCalculator()
+                    mc.surfaceTolerance = float(job.get('tol_mm', 0.01)) * 0.1
+                    tm = mc.calculate()
+                    stem = path[:-4]
+                    with open(stem + '_brep_v.bin', 'wb') as fh:
+                        array.array('d', [v * CM for v in tm.nodeCoordinatesAsDouble]).tofile(fh)
+                    with open(stem + '_brep_f.bin', 'wb') as fh:
+                        array.array('i', tm.nodeIndices).tofile(fh)
+                    row['tess_s'] = round(time.time() - t2, 2)
+                    row['tess_tris'] = tm.triangleCount
+            except Exception:
+                row['error'] = short_error(traceback.format_exc())
+    finally:
+        if not job.get('keep'):
+            doc.close(False)
+            if prev:
+                prev.activate()
+    return out
 
 
 def dev_wrap(app, job):
@@ -4100,6 +4565,9 @@ DEV_COMMANDS = {
     'rebuild_toolbar': dev_rebuild_toolbar,
     'purge_work': dev_purge_work,
     'wrap': dev_wrap,
+    'form_lab': dev_form_lab,
+    'remesh': dev_remesh,
+    'remesh_test': dev_remesh_test,
     'open_dialog': dev_open_dialog,
     'read_dialog': dev_read_dialog,
     'set_inputs': dev_set_inputs,

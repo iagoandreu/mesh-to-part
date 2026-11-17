@@ -48,18 +48,19 @@ uses the next panel on its short list (for example **Mesh > Prepare**).
 
   | Needs the external Python | Works without it |
   |---|---|
-  | Organic Form (T-Spline, built-in) | Cylinder / cone / box (analytic, any licence) |
-  | Organic NURBS (built-in) | Prismatic (planes, cylinders, cones) |
-  | Organic Form (quad cage, size-driven) | Organic (Form / T-Spline), Fusion's own, needs the extension |
-  | Smooth creases, Wrap offset (inside Mesh to Part) | Faceted (one face per triangle) |
-  | the **Wrap (offset)** command | |
-  | **Auto**, to propose a quad cage for an organic mesh (it builds trial cages) | |
+  | **Organic Form (quad remesh)** | Cylinder / cone / box (analytic, any licence) |
+  | Smooth creases, Wrap offset (inside Mesh to Part) | Prismatic (planes, cylinders, cones) |
+  | the **Wrap (offset)** command | Organic (Form / T-Spline), Fusion's own, needs the extension |
+  | | Faceted (one face per triangle) |
 
   Install the packages into that Python:
 
   ```
-  pip install numpy scipy trimesh pyvista
+  pip install numpy scipy trimesh pyvista open3d PyNanoInstantMeshes
   ```
+
+  `open3d` and `PyNanoInstantMeshes` are what **Organic Form (quad remesh)** needs;
+  without them it is not listed.
 
   `numpy`, `scipy` and `trimesh` are what the add-in checks for when it looks for
   an interpreter. `pyvista` is not checked, but Wrap, Smooth creases and the
@@ -82,6 +83,43 @@ uses the next panel on its short list (for example **Mesh > Prepare**).
 
   If none works, the three built-in organic methods are simply missing from the
   **Method** list.
+
+### Organic Form (quad remesh): the organic method
+
+For a bone or any other organic scan, pick **Organic Form (quad remesh)** (Auto picks
+it). It is the one organic method in the list; the earlier cube-sphere and quad-cage
+methods were retired from the dialog.
+
+1. Select the mesh (or a solid, to rebuild or offset it).
+2. **Maximum error**: the p99 deviation you accept, both directions. 0.1 mm is a good
+   value for a bone that a guide will sit on.
+3. **Element size (0 = auto)**: leave 0. Auto gives about 8000 quads over the surface
+   (3 mm on a 500 mm femur) and goes finer, within a minute, if the p99 is over the
+   maximum error.
+4. **Offset (0 = none)**: builds the body that far outside the mesh along its normal
+   (negative: inside), e.g. 0.2 mm for a clearance body. No Wrap needed for this.
+5. Convert. The progress dialog has a working **Cancel**: it stops the engine at
+   once and leaves nothing in the design.
+
+What happens: Instant Meshes lays a field-aligned quad cage over the mesh (about 2 %
+of its vertices extraordinary), and the cage is solved so its Catmull-Clark limit
+surface - the surface Fusion builds from it - lies on the mesh, by point-to-plane
+least squares in both directions. The cage goes to Fusion as one Form feature.
+Fusion's own tessellation of that body is then measured against the mesh, and that
+is what the report gives.
+
+Measured on a 500 mm artificial femur, live in Fusion:
+
+| input | time | B-Rep faces | p99 / rms both ways | volume |
+|---|---|---|---|---|
+| 173 286 triangles (1 mm mesh) | 20 s | 465 | 0.060 / 0.016 mm | +0.010 % |
+| 6 544 triangles | 20 s | 433 | 0.098 / 0.030 mm | +0.005 % |
+| 173 286 triangles, offset +0.2 mm | 30 s | 465 | offset achieved 0.200 mean, 0.14 - 0.22 mm | |
+
+The time depends on the cage, not on the triangles. The worst single point (0.58 and
+0.88 mm here) is one sharp spike at the femoral head, which a smooth surface does not
+follow; the report gives its position. The old quad-cage method made 20 178 B-Rep faces
+from the same femur in 3 to 6 minutes, and its retry ladder could not be cancelled.
 
 ### Mesh to Part, step by step
 
@@ -168,9 +206,7 @@ Many inputs only show for the method that uses them.
 | Method (label in the list) | Result | Use it for |
 |---|---|---|
 | Cylinder / cone / box (analytic, any licence) | an exact cylinder, cone (3 faces) or box (6 faces) | a tessellated pin, screw axis, drill sleeve, cut block or plate. Refused if the mesh is not one of these shapes. |
-| Organic Form (T-Spline, built-in) | Form body, 6 patches | a simple organic shape you want to sculpt. Parametric design only. |
-| Organic NURBS (built-in) | NURBS solid, 6 patches | an organic solid in a direct design. |
-| Organic Form (quad cage, size-driven) | Form body whose cage follows the anatomy | bone and other scans; what Auto picks for organic meshes. Parametric design only. |
+| **Organic Form (quad remesh)** | a Form body of a few hundred B-Rep faces, measured against the mesh | bones and every other organic scan; what Auto picks for organic meshes. Parametric design only. |
 | Prismatic (planes, cylinders, cones) | analytic faces | machined CAD meshes. Not available on Fusion Personal. |
 | Organic (Form / T-Spline) | Fusion's own T-Spline conversion | only with the Product Design Extension. |
 | Faceted (one face per triangle) | exact, one face per triangle | when nothing else works. Heavy on large meshes. |
@@ -274,9 +310,9 @@ design, then Batch STL Export.
   listed.
 - **Auto** looks at the first selected mesh only. It tries the analytic
   cylinder / cone / box fit only on meshes up to 20 000 triangles.
-- The organic fit is slow: about 30 s for cage 20, 70 s for cage 32. Auto does
-  not propose a quad cage above about 16 000 quads; if the budget needs more, it
-  says so.
+- **Organic Form (quad remesh)** needs a closed mesh (small holes are filled) and a
+  parametric design. Its time limit is a minute for the fit; a p99 budget it cannot
+  reach in that time is reported as OVER, with the best body built.
 - The mesh-convert API is marked *preview* by Autodesk; Fusion updates can change it.
 - A finer cube-sphere cage is more likely to self-intersect, which Fusion refuses.
   The Form ladder steps **down** until a cage is accepted, so the report may name
