@@ -16,6 +16,274 @@ require the Product Design Extension.
 *A 10 876-triangle calcaneus scan, and the six-patch T-Spline Form body built from
 it: watertight, volume within 0.23%, editable in the Form environment.*
 
+## How to use
+
+The add-in has two commands: **Mesh to Part** (mesh to solid or Form body) and
+**Wrap (offset)** (grow or shrink a body by a distance). Both are described below.
+
+### Where the buttons are
+
+In the **Design** workspace:
+
+| Button | Tab and panel |
+|---|---|
+| **Mesh to Part** | **Mesh** tab, **Modify** panel, and **Solid** tab, **Create** panel |
+| **Wrap (offset)** | **Mesh** tab, **Modify** panel, and **Solid** tab, **Modify** panel |
+
+Both buttons are promoted, so they show on the toolbar, not only in the panel's
+drop-down. If one of these panels does not exist in your Fusion build, the add-in
+uses the next panel on its short list (for example **Mesh > Prepare**).
+
+### Before you start
+
+- **A mesh body in the design**, for example a segmentation imported as STL
+  (**Insert > Insert Mesh**). If the design holds exactly one mesh body, Mesh to
+  Part selects it for you.
+- **For a Form (T-Spline) result, a parametric design.** The two Form methods
+  refuse to run with design history off. Turn it on (right-click the document name
+  in the browser, **Capture Design History**) or use **Organic NURBS**, which works
+  in a direct design.
+- **An external Python for some methods.** Fusion's own Python has no numpy, so
+  part of the work runs in a separate Python 3 install:
+
+  | Needs the external Python | Works without it |
+  |---|---|
+  | Organic Form (T-Spline, built-in) | Cylinder / cone / box (analytic, any licence) |
+  | Organic NURBS (built-in) | Prismatic (planes, cylinders, cones) |
+  | Organic Form (quad cage, size-driven) | Organic (Form / T-Spline), Fusion's own, needs the extension |
+  | Smooth creases, Wrap offset (inside Mesh to Part) | Faceted (one face per triangle) |
+  | the **Wrap (offset)** command | |
+  | **Auto**, to propose a quad cage for an organic mesh (it builds trial cages) | |
+
+  Install the packages into that Python:
+
+  ```
+  pip install numpy scipy trimesh pyvista
+  ```
+
+  `numpy`, `scipy` and `trimesh` are what the add-in checks for when it looks for
+  an interpreter. `pyvista` is not checked, but Wrap, Smooth creases and the
+  quad cage's *From the scan* source import it and fail without it. Two packages
+  are optional: `PyNanoInstantMeshes` (the *Instant Meshes* cage source) and
+  `gmsh` (the *gmsh remesh* cage source).
+
+  The add-in looks for the interpreter in this order and takes the first one that
+  can import numpy, scipy and trimesh:
+
+  1. the `MESHTOPART_PYTHON` environment variable (full path to `python.exe`);
+  2. a file `python_path.txt` beside the installed add-in
+     (`%APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns\MeshToPart\python_path.txt`)
+     holding that full path on one line;
+  3. `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`, then `Python311`,
+     then `Python310`;
+  4. `C:\Python312\python.exe`, `C:\Python311\python.exe`, `C:\Python310\python.exe`;
+  5. `/usr/bin/python3`, `/usr/local/bin/python3`;
+  6. the `py` launcher: `py -3.12`, `py -3.11`, `py -3.10`, `py -3`.
+
+  If none works, the three built-in organic methods are simply missing from the
+  **Method** list.
+
+### Mesh to Part, step by step
+
+1. Click **Mesh to Part**. The dialog opens with the OK button labelled **Convert**.
+2. In **Body**, select one or more mesh bodies. Each one is converted in turn with
+   the same settings. The selection also accepts a solid, but this command converts
+   mesh bodies only (use **Wrap (offset)** for a solid).
+3. Read the **Mesh** box: name, triangles, nodes, size in mm, watertight, oriented,
+   and volume when the mesh is closed.
+4. Optional: click **Analyse gaps**. The box then lists the open boundaries and the
+   widest gap, and says what gap limit closes them all.
+5. Set **Maximum error** (your budget in mm).
+6. Optional but recommended: click **Auto: choose settings for this mesh**. It
+   measures the first selected mesh and writes settings into the dialog. It
+   converts nothing. The box explains every choice it made. Change anything you
+   disagree with.
+7. Check or change the inputs below, then click **Convert**.
+
+The settings you used are saved (`last_settings.json` beside the installed
+add-in) and come back next time. The defaults below are the first-run values.
+Many inputs only show for the method that uses them.
+
+**Accuracy**
+
+| Input | Default | What it does |
+|---|---|---|
+| Maximum error | 0.1 mm | The budget. The result is measured against the original mesh and compared to it. Must be above 0. |
+| Keep retrying until the budget is met | on | If the first result is over budget, try again with finer settings (the "ladder"). |
+| Max attempts | 3 (1 to 4) | How many rungs of the ladder to try. Shown when retrying is on. |
+
+**Mesh preparation** (done on a working copy; the original mesh is not edited)
+
+| Input | Default | What it does |
+|---|---|---|
+| Fill small gaps / holes | on | Closes open boundaries before conversion. |
+| Ignore gaps larger than | 1.0 mm | Holes wider than this are left open. Hidden when the next box is ticked. |
+| Fill every hole regardless of size | off | Closes all holes. |
+| Fusion repair | None | Optional Fusion mesh repair: None, Stitch and remove artifacts, Close holes, One-touch fix, Wrap, Rebuild. |
+| Rebuild density | 128 (8 to 256) | Shown for **Rebuild** only. |
+| Reduce dense meshes | on | Reduces the triangle count with Fusion's adaptive reduce, at a maximum deviation taken from the budget. |
+| Only above N triangles | 150 000 | Reduce only meshes larger than this. |
+| Reduction share of the budget | 0.4 (0.05 to 0.9) | Fraction of **Maximum error** the reduction may use. 0.4 with a 0.1 mm budget allows 0.04 mm. |
+
+**Conversion**
+
+| Input | Default | Shown for | What it does |
+|---|---|---|---|
+| Method | Prismatic, or the first available | all | The conversion. Only methods your licence and Python allow are listed. See the table below. |
+| Organic resolution | Auto from max error | Organic (Fusion's) | Low, Medium, High, Precise, or By face count. |
+| Face count | 5000 | Organic, By face count | Target face count. |
+| Faceted: cap faces at | 20 000 | Faceted | A larger mesh is reduced to this many triangles first, because Faceted makes one face per triangle. |
+| Organic: cage from the error budget | on | Form (T-Spline), NURBS | Picks the cage size from the budget and the mesh size. |
+| Organic: cage per face | 24 (8 to 72) | Form, NURBS, when the box above is off | Cage size per cube face. |
+| Organic: control net / cage (NURBS only) | 0.5 | Form, NURBS | Ratio of control points to cage points. Below 1 the patch is a smoothing fit, not an interpolation. |
+| Quad cage: cage from | Instant Meshes | quad cage | *Instant Meshes* (cleanest quads, needs PyNanoInstantMeshes), *From the scan* (robust, any element size), *gmsh remesh* (needs gmsh). Instant Meshes falls back to the scan cage if the package is missing. |
+| Quad cage: target element size | 2.0 mm | quad cage | Edge length of the cage quads. Smaller is more accurate and slower. |
+| Quad cage: elements per curvature circle | 16 (0 to 60) | quad cage with gmsh | gmsh's curvature refinement. |
+| Organic: max edge ratio in an element (0 = off) | 1.2 | Form, NURBS, quad cage | Limit on longest/shortest edge within one element. |
+| Organic: edge-ratio passes | 80 | Form, NURBS | Passes spent on that limit. |
+| Organic: edge equalising passes (0 = off) | 120 | Form, NURBS | Passes that even out edge lengths. |
+| Organic: min element edge (0 = off) | 1.5 mm | Form, NURBS, quad cage with gmsh | Smallest element edge allowed. |
+| Smooth creases: passes (0 = off) | 0 | always | Volume-preserving smoothing of the working mesh before conversion. Not used by Cylinder / cone / box. |
+| Wrap: offset distance (0 = off) | 0 mm | always | Offsets the working mesh before conversion (same engine as the Wrap command). Not used by Cylinder / cone / box. |
+| Wrap: close gaps up to | 0 mm | always | Gap closing for that offset. |
+| Organic: fairness (NURBS only) | 0.01 | Form, NURBS | Smoothing weight of the NURBS fit. |
+| Organic: relax passes | 70 | Form, NURBS | Passes that slide the cage along the surface into concavities. |
+| Smooth remaining open hole boundaries | on | Organic (Fusion's) | Fusion's hole preprocessing. |
+| Generate face groups (prismatic) | on | Prismatic | Groups triangles into faces before conversion. |
+| Feature angle | 25 deg | Prismatic, face groups on | Angle that separates face groups. |
+| Smallest face group (area fraction) | 0.02 | Prismatic, face groups on | Smaller groups are merged. |
+| Output | Parametric feature | all | *Parametric feature* or *Base feature (direct)*. Applies to Fusion's own methods (Prismatic, Organic, Faceted). |
+
+**After conversion**
+
+| Input | Default | What it does |
+|---|---|---|
+| Measure the real deviation | on | Measures the result against the original mesh, both ways. Off means no check, and the first result is kept. |
+| Fall back to Faceted if the method fails | on | If the method gives no usable body, or is not allowed by the licence, use Faceted instead. The report says so. |
+| Hide the original mesh | on | Hides the source mesh body after conversion. |
+| Show the report when finished | on | Shows the report in a message box. It is saved to a file either way. |
+
+**Which method to pick**
+
+| Method (label in the list) | Result | Use it for |
+|---|---|---|
+| Cylinder / cone / box (analytic, any licence) | an exact cylinder, cone (3 faces) or box (6 faces) | a tessellated pin, screw axis, drill sleeve, cut block or plate. Refused if the mesh is not one of these shapes. |
+| Organic Form (T-Spline, built-in) | Form body, 6 patches | a simple organic shape you want to sculpt. Parametric design only. |
+| Organic NURBS (built-in) | NURBS solid, 6 patches | an organic solid in a direct design. |
+| Organic Form (quad cage, size-driven) | Form body whose cage follows the anatomy | bone and other scans; what Auto picks for organic meshes. Parametric design only. |
+| Prismatic (planes, cylinders, cones) | analytic faces | machined CAD meshes. Not available on Fusion Personal. |
+| Organic (Form / T-Spline) | Fusion's own T-Spline conversion | only with the Product Design Extension. |
+| Faceted (one face per triangle) | exact, one face per triangle | when nothing else works. Heavy on large meshes. |
+
+### What you get
+
+All output goes into the same component as the source mesh.
+
+- The converted body, named **`<mesh name> [part]`**.
+- For **Cylinder / cone / box** in a parametric design: a base feature named
+  `<mesh name> [cylinder fit]`, `[cone fit]` or `[box fit]` holding that body.
+- For the Form methods: a Form feature you can edit in the Form environment.
+- For Fusion's own methods: the mesh features in the timeline (repair, reduce,
+  face groups, convert), applied to a working copy.
+- A working copy named `<mesh name> [work HHMMSS]` (and `[work smooth ...]` or
+  `[work wrap ...]` when those options are on). The original mesh is never
+  edited. If a working copy is left over after the conversion it is hidden;
+  delete it once you are happy with the result.
+- The original mesh is hidden when **Hide the original mesh** is on.
+- A report, shown in a message box and saved as
+  `reports\report_YYYYMMDD_HHMMSS.txt` beside the installed add-in. Errors and
+  tracebacks go to `MeshToPart.log` in the same folder.
+
+### Checking the result
+
+The report has four parts: **INPUT**, **PREPARATION**, **CONVERSION** and
+**MEASURED DEVIATION**. Before you use the part:
+
+1. Read **MEASURED DEVIATION**. It gives max, p99, p95 and RMS in mm in two
+   directions: `part -> mesh` (how far the new surface is from the mesh) and
+   `mesh -> part` (how far the mesh is from the new surface, which catches
+   geometry the conversion dropped). The line **worst of both directions** is the
+   number compared with your budget.
+2. Read the **RESULT** line: *within the budget* or *OVER the budget by ... mm*.
+   Over budget means the part was kept anyway; the report says what to change.
+3. Check **solid**: it should be `True` for a closed scan. If the source was closed
+   and the result is not a solid, a **WARNING** line says geometry was dropped.
+4. Check **method**: if it says *fell back from ...*, you got Faceted, not the
+   method you chose. **ladder** and **used** show which attempt was kept.
+5. Read **NOTES** for failed repair, reduction, smoothing or offset steps.
+6. For a cylinder or cone, check the fitted diameter, length and axis. The report
+   also says how far the mesh flats sit inside the fitted circle.
+7. If the max is much larger than p95, the error sits at a few isolated spots
+   (often sharp creases in the scan). Look at those spots in Fusion before
+   deciding whether they matter.
+
+With **Measure the real deviation** off there are no deviation figures at all.
+The measurements check the conversion; they do not validate the device design.
+
+### Wrap (offset), step by step
+
+1. Click **Wrap (offset)**. The OK button is labelled **Wrap**.
+2. In **Body**, select one mesh body or one solid.
+3. Set the inputs below and click **Wrap**.
+
+| Input | Default | What it does |
+|---|---|---|
+| Offset distance | 4.0 mm | Grows the body by this distance; a negative value shrinks it. Cannot be 0. |
+| Close gaps up to | 0 mm | Closes gaps up to this size before the offset (0 = off). |
+| Smooth creases: passes | 0 (0 to 200) | Smoothing passes on the offset surface. |
+| Create | Offset mesh body only | *Offset mesh body only*, *Solid: quad cage Form (size-driven)*, or *Solid: organic NURBS*. |
+| Solid: target element size | 8.0 mm | Shown for the quad cage Form. Cage element size. |
+| Solid: min element edge | 1.5 mm | Shown for the quad cage Form. Only used by a gmsh cage, which Wrap does not select, so it has no effect in practice. |
+| Solid: elements per curvature circle | 16 | Shown for the quad cage Form. Same note as above. |
+| Hide the original | on | Hides the selected body afterwards. |
+
+Wrap settings are saved separately (`last_settings.json.wrap`).
+
+**What you get:** a mesh body named `<body name> [wrap +4.00]` (the signed offset
+in mm) in the same component. With a **Solid** option, that mesh is then run
+through Mesh to Part with fixed settings (budget 1.0 mm, 3 attempts, no
+reduction, deviation measured) and the solid is named
+`<body name> [wrap +4.00] [part]`; the offset mesh is then hidden. The quad cage
+Form needs a parametric design.
+
+**Checking the result:** Wrap does **not** open a report window. It writes the
+report to `reports\report_YYYYMMDD_HHMMSS.txt` beside the installed add-in and one
+summary line to Fusion's Text Commands window. The report gives the requested
+offset, the **achieved** offset (mean, min, max in mm, measured from the new
+surface back to the source), the RMS spread, the voxel pitch, and whether the
+offset mesh is watertight. Check min and max against what you asked for. With a
+Solid option, the Mesh to Part report follows; its deviation is measured against
+the offset mesh, not the body you selected.
+
+### Where it fits in a patient-specific workflow
+
+A segmentation exported as STL is a mesh; Fusion can only cut, combine and shell
+solids. Mesh to Part turns the bone mesh into a solid (or Form body) you can
+subtract from a guide blank, and turns tessellated pins or screw axes into exact
+cylinders for trajectories. Wrap gives an offset shell around the anatomy, for
+example a clearance gap between a guide and the bone. A typical order is:
+segmentation STL, then Global Registration, then Mesh to Part, then guide or plate
+design, then Batch STL Export.
+
+### Known limits
+
+- The two Form methods need a **parametric** design. In a direct design they stop
+  with a message; use Organic NURBS.
+- **Prismatic** is not available on Fusion Personal; **Organic** (Fusion's own)
+  needs the Product Design Extension. Methods the licence does not allow are not
+  listed.
+- **Auto** looks at the first selected mesh only. It tries the analytic
+  cylinder / cone / box fit only on meshes up to 20 000 triangles.
+- The organic fit is slow: about 30 s for cage 20, 70 s for cage 32. Auto does
+  not propose a quad cage above about 16 000 quads; if the budget needs more, it
+  says so.
+- The mesh-convert API is marked *preview* by Autodesk; Fusion updates can change it.
+- A finer cube-sphere cage is more likely to self-intersect, which Fusion refuses.
+  The Form ladder steps **down** until a cage is accepted, so the report may name
+  a coarser cage than you asked for.
+- The quad cage's elements are accurate but not tidy. If you will sculpt the
+  result by hand, try the gmsh source; the report says if it lost anything.
+
 ## Why
 
 Fusion's own **Convert Mesh → Organic** needs the Product Design Extension. Without
@@ -145,7 +413,8 @@ number. Output is a mesh body, or straight through to a solid.
    `%APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns\MeshToPart`.
 3. In Fusion: **Utilities → ADD-INS → Scripts and Add-Ins → Add-Ins** →
    `Mesh to Part` → tick **Run on Startup** → **Run**.
-4. The button appears in **Mesh → Modify** and **Solid → Create**.
+4. The button appears in **Mesh → Modify** and **Solid → Create**, and
+   **Wrap (offset)** in **Mesh → Modify** and **Solid → Modify**.
 
 ### The one external requirement
 
@@ -164,8 +433,9 @@ the scan cage.
 
 The add-in finds an interpreter automatically — the `MESHTOPART_PYTHON`
 environment variable, a `python_path.txt` beside the add-in, the usual install
-locations, then the `py` launcher. If none is found, the two organic methods are
-simply absent from the method list. Prismatic and Faceted work without it.
+locations, then the `py` launcher. If none is found, the three built-in organic
+methods are simply absent from the method list. Cylinder / cone / box, Prismatic
+and Faceted work without it.
 
 ## How the organic conversion works
 
