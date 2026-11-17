@@ -3057,7 +3057,7 @@ def place_button(ui, cmd_def, groups=None):
 # --------------------------------------------------------------------------- #
 
 WRAP_OUTPUTS = ['Offset mesh body only',
-                'Solid: quad cage Form (size-driven)',
+                'Solid: Form (quad remesh)',
                 'Solid: organic NURBS']
 
 WRAP_DEFAULTS = {
@@ -3119,8 +3119,9 @@ def on_wrap_created(app, cmd):
 
 def on_wrap_input_changed(app, inputs, changed_id):
     idx = inputs.itemById('wOutput').selectedItem.index
+    # the Form output is the quad remesh, which sizes its own elements
     for cid in ('wQuadSize', 'wMinEdge', 'wCurv'):
-        inputs.itemById(cid).isVisible = (idx == 1)
+        inputs.itemById(cid).isVisible = False
     off = inputs.itemById('wOffset').value * CM
     tail = ('' if idx else ' The result is a mesh body; convert it with Mesh to '
             'Part when you are happy with it.')
@@ -3158,6 +3159,27 @@ def on_wrap_execute(app, ui, inputs):
         'wCurv': inputs.itemById('wCurv').value,
         'wHide': inputs.itemById('wHide').value,
     })
+
+    if (out_idx == 1 and not params['close_mm'] and not params['smooth_iters']
+            and probe_methods(src.parentComponent, src)['remesh'][0]):
+        # a Form wrap with nothing to close: the remesh offsets the fitted surface
+        # exactly, in one step - no voxel offset mesh in between
+        o = dev_options({'method_key': 'remesh', 'max_error_mm': 0.1,
+                         'remesh_offset_mm': params['offset_mm'],
+                         'hide_source': inputs.itemById('wHide').value})
+        progress = app.userInterface.createProgressDialog()
+        progress.isCancelButtonShown = True
+        progress.show('Wrap', 'Starting', 0, 1, 0)
+        try:
+            rep = remesh_part(app, src, o, progress)
+            text = format_remesh_report(rep)
+        except Cancelled:
+            text = 'Wrap of %s cancelled; nothing was left in the design.' % src.name
+        finally:
+            progress.hide()
+        path = write_report(text)
+        log(text)
+        return path
 
     logs = []
     mesh_body, res, _base = wrap_body(app, src, params, logs)
